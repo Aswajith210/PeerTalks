@@ -7,7 +7,7 @@ import { TokenBalance } from "@/components/tokens/TokenBalance";
 import { useAuth } from "@/hooks/useAuth";
 import { useTokens } from "@/hooks/useTokens";
 import { useRouter } from "next/navigation";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useToast } from "@/hooks/useToast";
 import { RecentSessions } from "@/components/dashboard/RecentSessions";
 import { motion } from "framer-motion";
@@ -60,9 +60,12 @@ function DashboardContent() {
   const { balance, loading: tokensLoading } = useTokens();
   const toast = useToast();
 
+  const hasClaimed = useRef(false);
+
   useEffect(() => {
     const ensureTokens = async () => {
-      if (!user) return;
+      if (!user || hasClaimed.current) return;
+      hasClaimed.current = true;
       try {
         const res = await fetch("/api/tokens/claim", { method: "POST" });
         const data = await res.json();
@@ -72,7 +75,8 @@ function DashboardContent() {
       } catch {}
     };
     ensureTokens();
-  }, [user, toast]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]);
 
   const hours = new Date().getHours();
   const greeting = hours < 12 ? "Good morning" : hours < 17 ? "Good afternoon" : "Good evening";

@@ -53,25 +53,22 @@ export async function POST(request: Request) {
     );
   }
 
-  await supabase
-    .from("private_rooms")
-    .update({ guest_id: session.user.id })
-    .eq("id", room.id);
+  // Use security definer RPC to assign guest + manage chat session
+  const { data: joinResult, error: joinError } = await supabase
+    .rpc("join_private_room_as_guest", {
+      p_room_id: room.id,
+      p_guest_id: session.user.id,
+    });
 
-  const { data: chatSession } = await supabase
-    .from("chat_sessions")
-    .insert({
-      mode: "private_room",
-      status: "connected",
-      user1_id: room.host_id,
-      user2_id: session.user.id,
-      room_id: room.id,
-    })
-    .select()
-    .single();
+  if (joinError || !joinResult?.success) {
+    return NextResponse.json(
+      { error: joinResult?.error || "Failed to join room" },
+      { status: 500 }
+    );
+  }
 
   return NextResponse.json({
     room,
-    session: chatSession,
+    session: { id: joinResult.session_id },
   });
 }

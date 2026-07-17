@@ -235,15 +235,21 @@ function ChatRoomContent() {
         ],
       });
 
-      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-
       pc.ontrack = (event) => {
-        setRemoteStream(event.streams[0]);
+        if (event.streams[0]) setRemoteStream(event.streams[0]);
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        if (pc.iceConnectionState === "disconnected") {
+          pc.restartIce();
+        }
       };
 
       pc.onconnectionstatechange = () => {
         setConnectionState(pc.connectionState);
       };
+
+      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
       pcRef.current = pc;
       setJoined(true);

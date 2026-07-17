@@ -46,3 +46,4 @@ next-env.d.ts
 # dev logs
 dev_error.txt
 dev_output.txt
+dev_*.txt

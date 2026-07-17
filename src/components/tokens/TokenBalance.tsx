@@ -9,7 +9,7 @@ interface TokenBalanceProps {
 export function TokenBalance({ className = "" }: TokenBalanceProps) {
   const { balance, loading } = useTokens();
 
-  if (loading || balance === 0) return null;
+  if (loading) return null;
 
   return (
     <div className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.08] ${className}`}>

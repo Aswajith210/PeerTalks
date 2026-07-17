@@ -4,6 +4,16 @@ import { NextResponse } from "next/server";
 import bcrypt from "bcryptjs";
 import { validateInput, schemas } from "@/lib/validations";
 
+async function refundOnError(supabase: NonNullable<Awaited<ReturnType<typeof createServerSupabaseClient>>>, userId: string) {
+  await supabase.rpc("deduct_tokens", {
+    p_user_id: userId,
+    p_amount: -5,
+    p_type: "refund",
+    p_description: "Room creation failed - token refund",
+    p_session_id: null,
+  });
+}
+
 export async function POST(request: Request) {
   const supabase = await createServerSupabaseClient();
   if (!supabase) {
@@ -45,5 +55,28 @@ export async function POST(request: Request) {
     .select()
     .single();
 
-  return NextResponse.json(room);
+  if (!room) {
+    await refundOnError(supabase, session.user.id);
+    return NextResponse.json({ error: "Failed to create room" }, { status: 500 });
+  }
+
+  const { data: chatSession } = await supabase
+    .from("chat_sessions")
+    .insert({
+      mode: "private_room",
+      status: "waiting",
+      user1_id: session.user.id,
+      room_id: room.id,
+    })
+    .select()
+    .single();
+
+  if (!chatSession) {
+    // Room created but session failed — clean up
+    await supabase.from("private_rooms").delete().eq("id", room.id);
+    await refundOnError(supabase, session.user.id);
+    return NextResponse.json({ error: "Failed to create chat session" }, { status: 500 });
+  }
+
+  return NextResponse.json({ room, session: chatSession });
 }

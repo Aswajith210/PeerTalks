@@ -1,5 +1,5 @@
 import { createServerSupabaseClient } from "@/lib/supabase/server";
-import { deductTokens, refundTokens } from "@/lib/tokens";
+import { refundTokens } from "@/lib/tokens";
 import { NextResponse } from "next/server";
 import { validateInput, schemas } from "@/lib/validations";
 
@@ -25,14 +25,7 @@ export async function POST(request: Request) {
   const { interests } = body;
   const userId = session.user.id;
 
-  const deduction = await deductTokens(userId, 2, "Interest-based chat");
-  if (!deduction.success) {
-    return NextResponse.json(
-      { error: "Insufficient tokens", balance: deduction.balance },
-      { status: 400 }
-    );
-  }
-
+  // Save user interests
   for (const interest of interests) {
     await supabase.from("user_interests").upsert(
       { user_id: userId, interest: interest.toLowerCase().trim() },
@@ -40,82 +33,42 @@ export async function POST(request: Request) {
     );
   }
 
-  const { data: existingMatches } = await supabase
-    .from("matching_queue")
-    .select("*, user_id")
-    .eq("mode", "interest")
-    .eq("status", "waiting")
-    .neq("user_id", userId)
-    .order("created_at", { ascending: true });
+  // Atomic token deduction via RPC
+  const { data: deduction } = await supabase.rpc("deduct_tokens", {
+    p_user_id: userId,
+    p_amount: 2,
+    p_type: "chat_cost",
+    p_description: "Interest-based chat",
+    p_session_id: null,
+  });
 
-  let bestMatch: Record<string, unknown> | null = null;
-  let matchedInterest = "";
-
-  if (existingMatches) {
-    for (const entry of existingMatches) {
-      const overlap = (entry.interests as string[])?.filter((i: string) =>
-        interests.some((j: string) => j.toLowerCase() === i.toLowerCase())
-      );
-      if (overlap && overlap.length > 0) {
-        bestMatch = entry;
-        matchedInterest = overlap[0];
-        break;
-      }
-    }
+  if (!deduction?.success) {
+    return NextResponse.json(
+      { error: "Insufficient tokens", balance: deduction?.balance ?? 0 },
+      { status: 400 }
+    );
   }
 
-  if (bestMatch) {
-    const matchUserId = bestMatch.user_id as string;
-    const matchId = bestMatch.id as number;
+  // Use security definer RPC to find an interest match (bypasses RLS)
+  const { data: matchResult, error: matchError } = await supabase
+    .rpc("find_interest_match", { p_user_id: userId, p_interests: interests });
 
-    const { data: chatSession } = await supabase
-      .from("chat_sessions")
-      .insert({
-        mode: "interest",
-        status: "connected",
-        user1_id: matchUserId,
-        user2_id: userId,
-      })
-      .select()
-      .single();
-
-    if (chatSession) {
-      await supabase
-        .from("matching_queue")
-        .update({
-          status: "matched",
-          matched_user_id: userId,
-          session_id: chatSession.id,
-          matched_at: new Date().toISOString(),
-        })
-        .eq("id", matchId);
-
-      await supabase.from("matching_queue").insert({
-        user_id: userId,
-        mode: "interest",
-        interests,
-        status: "matched",
-        matched_user_id: matchUserId,
-        session_id: chatSession.id,
-        matched_at: new Date().toISOString(),
-      });
-
-      return NextResponse.json({
-        matched: true,
-        sessionId: chatSession.id,
-        matchedInterest,
-      });
-    }
+  if (matchError) {
+    return NextResponse.json({ error: "Matching failed" }, { status: 500 });
   }
 
+  if (matchResult?.matched) {
+    return NextResponse.json({
+      matched: true,
+      sessionId: matchResult.session_id,
+      matchedInterest: "",
+    });
+  }
+
+  // No match — join waiting queue
   const { data: queueEntry } = await supabase
     .from("matching_queue")
-    .insert({
-      user_id: userId,
-      mode: "interest",
-      interests,
-      status: "waiting",
-    })
+    .insert({ user_id: userId, mode: "interest", interests, status: "waiting" })
     .select()
     .single();
 

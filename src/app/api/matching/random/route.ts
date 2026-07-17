@@ -1,5 +1,5 @@
 import { createServerSupabaseClient } from "@/lib/supabase/server";
-import { deductTokens, refundTokens } from "@/lib/tokens";
+import { refundTokens } from "@/lib/tokens";
 import { NextResponse } from "next/server";
 
 export async function POST() {
@@ -17,73 +17,42 @@ export async function POST() {
 
   const userId = session.user.id;
 
-  const deduction = await deductTokens(userId, 2, "Random chat");
-  if (!deduction.success) {
+  // Atomic token deduction via RPC
+  const { data: deduction } = await supabase.rpc("deduct_tokens", {
+    p_user_id: userId,
+    p_amount: 2,
+    p_type: "chat_cost",
+    p_description: "Random chat",
+    p_session_id: null,
+  });
+
+  if (!deduction?.success) {
     return NextResponse.json(
-      { error: "Insufficient tokens", balance: deduction.balance },
+      { error: "Insufficient tokens", balance: deduction?.balance ?? 0 },
       { status: 400 }
     );
   }
 
-  const { data: existingMatch } = await supabase
-    .from("matching_queue")
-    .select("*, user_id, profiles!inner(display_name, avatar_url)")
-    .eq("mode", "random")
-    .eq("status", "waiting")
-    .neq("user_id", userId)
-    .order("created_at", { ascending: true })
-    .limit(1)
-    .single();
+  // Use security definer RPC to find a match (bypasses RLS)
+  const { data: matchResult, error: matchError } = await supabase
+    .rpc("find_random_match", { p_user_id: userId });
 
-  if (existingMatch) {
-    const { data: session } = await supabase
-      .from("chat_sessions")
-      .insert({
-        mode: "random",
-        status: "connected",
-        user1_id: existingMatch.user_id,
-        user2_id: userId,
-      })
-      .select()
-      .single();
-
-    if (session) {
-      await supabase
-        .from("matching_queue")
-        .update({
-          status: "matched",
-          matched_user_id: userId,
-          session_id: session.id,
-          matched_at: new Date().toISOString(),
-        })
-        .eq("id", existingMatch.id);
-
-      await supabase.from("matching_queue").insert({
-        user_id: userId,
-        mode: "random",
-        status: "matched",
-        matched_user_id: existingMatch.user_id,
-        session_id: session.id,
-        matched_at: new Date().toISOString(),
-      });
-
-      return NextResponse.json({
-        matched: true,
-        sessionId: session.id,
-        peer: {
-          id: existingMatch.user_id,
-        },
-      });
-    }
+  if (matchError) {
+    return NextResponse.json({ error: "Matching failed" }, { status: 500 });
   }
 
+  if (matchResult?.matched) {
+    return NextResponse.json({
+      matched: true,
+      sessionId: matchResult.session_id,
+      peer: { id: matchResult.peer_id },
+    });
+  }
+
+  // No match — join waiting queue
   const { data: queueEntry } = await supabase
     .from("matching_queue")
-    .insert({
-      user_id: userId,
-      mode: "random",
-      status: "waiting",
-    })
+    .insert({ user_id: userId, mode: "random", status: "waiting" })
     .select()
     .single();
 

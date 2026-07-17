@@ -39,7 +39,7 @@ function PrivateRoomContent() {
         return;
       }
 
-      router.push(`/chat/room/${data.id}`);
+      router.push(`/chat/room/${data.session?.id || data.room?.id}`);
     } catch {
       setError("Something went wrong");
       setLoading(false);

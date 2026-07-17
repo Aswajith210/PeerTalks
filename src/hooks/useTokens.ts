@@ -46,8 +46,10 @@ export function useTokens() {
       if (mountedRef.current) {
         if (error) {
           setState({ balance: 0, loading: false, error: error.message });
-        } else {
+        } else if (data) {
           setState({ balance: data.balance, loading: false, error: null });
+        } else {
+          setState({ balance: 0, loading: false, error: null });
         }
       }
 
