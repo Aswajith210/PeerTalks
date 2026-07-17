@@ -74,25 +74,6 @@ function InterestChatContent() {
     unsubscribeMatching();
 
     try {
-      const res = await fetch("/api/matching/interest", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ interests }),
-      });
-      const data = await res.json();
-
-      if (!res.ok) {
-        setError(data.error || "Failed to start matching");
-        setStatus("select");
-        return;
-      }
-
-      if (data.matched && data.sessionId) {
-        setStatus("connected");
-        setTimeout(() => router.push(`/chat/room/${data.sessionId}`), 800);
-        return;
-      }
-
       const supabase = supabaseRef.current;
       if (!supabase) return;
 
@@ -121,6 +102,25 @@ function InterestChatContent() {
         .subscribe();
 
       subscriptionRef.current = channel;
+
+      const res = await fetch("/api/matching/interest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ interests }),
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        setError(data.error || "Failed to start matching");
+        setStatus("select");
+        return;
+      }
+
+      if (data.matched && data.sessionId) {
+        setStatus("connected");
+        setTimeout(() => router.push(`/chat/room/${data.sessionId}`), 800);
+        return;
+      }
     } catch {
       setError("Something went wrong. Please try again.");
       setStatus("select");

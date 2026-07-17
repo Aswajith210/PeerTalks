@@ -139,14 +139,14 @@ export function FloatingPreview({ stream, audioEnabled, videoEnabled }: Floating
 
         {/* Audio indicator */}
         <div className="absolute top-2 right-2">
-          <div className={`w-6 h-6 rounded-lg flex items-center justify-center ${
+            <div className={`w-6 h-6 rounded-lg flex items-center justify-center ${
             audioEnabled ? "bg-white/[0.06]" : "bg-error-soft/70"
           }`}>
             <svg className={`w-3 h-3 ${audioEnabled ? "text-white/50" : "text-error/70"}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
               {audioEnabled ? (
-                <rect x="9" y="2" width="6" height="11" rx="3" />
+                <><rect x="9" y="2" width="6" height="11" rx="3" /><path d="M5 10a7 7 0 0014 0" /><path d="M12 18v3" /></>
               ) : (
-                <rect x="9" y="2" width="6" height="11" rx="3" />
+                <><rect x="9" y="2" width="6" height="11" rx="3" /><path d="M5 10a7 7 0 0014 0" /><path d="M12 18v3" /><path d="M3 3l18 18" opacity={0.5} /></>
               )}
             </svg>
           </div>

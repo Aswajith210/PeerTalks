@@ -59,21 +59,6 @@ function RandomChatContent() {
     unsubscribeMatching();
 
     try {
-      const res = await fetch("/api/matching/random", { method: "POST" });
-      const data = await res.json();
-
-      if (!res.ok) {
-        setMatchError(data.error || "Failed to start matching");
-        setStatus("select");
-        return;
-      }
-
-      if (data.matched && data.sessionId) {
-        setStatus("connected");
-        setTimeout(() => router.push(`/chat/room/${data.sessionId}`), 800);
-        return;
-      }
-
       const supabase = supabaseRef.current;
       if (!supabase) {
         setMatchError("Failed to initialize connection");
@@ -106,6 +91,21 @@ function RandomChatContent() {
         .subscribe();
 
       subscriptionRef.current = channel;
+
+      const res = await fetch("/api/matching/random", { method: "POST" });
+      const data = await res.json();
+
+      if (!res.ok) {
+        setMatchError(data.error || "Failed to start matching");
+        setStatus("select");
+        return;
+      }
+
+      if (data.matched && data.sessionId) {
+        setStatus("connected");
+        setTimeout(() => router.push(`/chat/room/${data.sessionId}`), 800);
+        return;
+      }
     } catch {
       setMatchError("Something went wrong. Please try again.");
       setStatus("select");

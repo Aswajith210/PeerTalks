@@ -8,7 +8,6 @@ import { useAuth } from "@/hooks/useAuth";
 import { useTokens } from "@/hooks/useTokens";
 import { useRouter } from "next/navigation";
 import { useEffect } from "react";
-import { createClient } from "@/lib/supabase/client";
 import { useToast } from "@/hooks/useToast";
 import { RecentSessions } from "@/components/dashboard/RecentSessions";
 import { motion } from "framer-motion";
@@ -64,12 +63,13 @@ function DashboardContent() {
   useEffect(() => {
     const ensureTokens = async () => {
       if (!user) return;
-      const supabase = await createClient();
-      if (!supabase) return;
-      const { data, error } = await supabase.rpc("claim_daily_tokens");
-      if (!error && data?.claimed) {
-        toast.success("Daily tokens claimed!", `${data.balance} tokens available`);
-      }
+      try {
+        const res = await fetch("/api/tokens/claim", { method: "POST" });
+        const data = await res.json();
+        if (data.claimed) {
+          toast.success("Daily tokens claimed!", `${data.balance} tokens available`);
+        }
+      } catch {}
     };
     ensureTokens();
   }, [user, toast]);

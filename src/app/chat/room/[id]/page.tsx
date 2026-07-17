@@ -31,12 +31,18 @@ function ChatRoomContent() {
   const localStreamRef = useRef<MediaStream | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const msgChannelRef = useRef<RealtimeChannel | null>(null);
+  const signalingChannelRef = useRef<RealtimeChannel | null>(null);
+  const userIdRef = useRef<string | null>(null);
   const { reactionsRef, addReaction } = useReactions();
   const [reactions, setReactions] = useState<{ id: string; icon: import("@/components/icons/icons").IconName }[]>([]);
 
   useEffect(() => {
-    createClient().then((client) => {
+    createClient().then(async (client) => {
       supabaseRef.current = client as unknown as SupabaseClient | null;
+      if (client) {
+        const { data: { session } } = await (client as unknown as SupabaseClient).auth.getSession();
+        userIdRef.current = session?.user?.id ?? null;
+      }
     });
   }, []);
 
@@ -121,10 +127,100 @@ function ChatRoomContent() {
 
     return () => {
       cancelled = true;
+      if (signalingChannelRef.current && supabaseRef.current) {
+        supabaseRef.current.removeChannel(signalingChannelRef.current);
+        signalingChannelRef.current = null;
+      }
       stopLocalStream(localStreamRef.current);
       pcRef.current?.close();
+      pcRef.current = null;
     };
   }, []);
+
+  const initiateSignaling = useCallback(async (pc: RTCPeerConnection, isOfferer: boolean) => {
+    const supabase = getSupabase();
+    if (!supabase) return;
+
+    const channelName = `signaling:${id}`;
+    if (signalingChannelRef.current) {
+      supabase.removeChannel(signalingChannelRef.current);
+    }
+
+    const channel = supabase.channel(channelName);
+
+    channel.on("broadcast", { event: "reaction" }, (payload) => {
+      const { type } = payload.payload as { type: string };
+      if (type) {
+        addReaction(type);
+        setReactions([...reactionsRef.current]);
+        setTimeout(() => {
+          setReactions([...reactionsRef.current]);
+        }, 100);
+      }
+    });
+
+    channel.on("broadcast", { event: "signal" }, async (payload) => {
+      const signal = payload.payload;
+      if (signal.type === "offer") {
+        try {
+          await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: signal.sdp }));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          await channel.send({
+            type: "broadcast",
+            event: "signal",
+            payload: { type: "answer", sdp: answer.sdp! },
+          });
+        } catch (e) {
+          console.error("[signaling] Failed to handle offer:", e);
+        }
+      } else if (signal.type === "answer") {
+        try {
+          if (pc.signalingState !== "stable") {
+            await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: signal.sdp }));
+          }
+        } catch (e) {
+          console.error("[signaling] Failed to handle answer:", e);
+        }
+      } else if (signal.type === "ice-candidate") {
+        try {
+          if (signal.candidate) {
+            await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+          }
+        } catch (e) {
+          console.error("[signaling] Failed to add ICE candidate:", e);
+        }
+      }
+    });
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        channel.send({
+          type: "broadcast",
+          event: "signal",
+          payload: { type: "ice-candidate", candidate: event.candidate.toJSON() },
+        }).catch(() => {});
+      }
+    };
+
+    await channel.subscribe();
+    signalingChannelRef.current = channel;
+
+    if (isOfferer) {
+      await new Promise((r) => setTimeout(r, 500));
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await channel.send({
+          type: "broadcast",
+          event: "signal",
+          payload: { type: "offer", sdp: offer.sdp! },
+        });
+      } catch (e) {
+        console.error("[signaling] Failed to create offer:", e);
+      }
+    }
+  }, [id, addReaction, reactionsRef]);
 
   const handleJoin = useCallback(async () => {
     setIsJoining(true);
@@ -151,10 +247,30 @@ function ChatRoomContent() {
 
       pcRef.current = pc;
       setJoined(true);
+
+      const supabase = getSupabase();
+      if (!supabase) return;
+
+      const { data: { session } } = await supabase.auth.getSession();
+      const userId = session?.user?.id;
+      if (!userId) return;
+
+      const { data: chatSession } = await supabase
+        .from("chat_sessions")
+        .select("user1_id, user2_id")
+        .eq("id", id)
+        .single();
+
+      if (!chatSession) return;
+
+      const otherUserId = chatSession.user1_id === userId ? chatSession.user2_id : chatSession.user1_id;
+      const isOfferer = otherUserId ? userId > otherUserId : true;
+
+      initiateSignaling(pc, isOfferer);
     } finally {
       setIsJoining(false);
     }
-  }, []);
+  }, [id, initiateSignaling]);
 
   const sendMessage = async () => {
     if (!newMessage.trim()) return;
@@ -176,8 +292,17 @@ function ChatRoomContent() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessionId: id }),
     });
+    if (signalingChannelRef.current && supabaseRef.current) {
+      supabaseRef.current.removeChannel(signalingChannelRef.current);
+      signalingChannelRef.current = null;
+    }
+    if (msgChannelRef.current && supabaseRef.current) {
+      supabaseRef.current.removeChannel(msgChannelRef.current);
+      msgChannelRef.current = null;
+    }
     stopLocalStream(localStreamRef.current);
     pcRef.current?.close();
+    pcRef.current = null;
     router.push("/dashboard");
   };
 
@@ -197,6 +322,13 @@ function ChatRoomContent() {
     setTimeout(() => {
       setReactions([...reactionsRef.current]);
     }, 100);
+    if (signalingChannelRef.current) {
+      signalingChannelRef.current.send({
+        type: "broadcast",
+        event: "reaction",
+        payload: { type },
+      }).catch(() => {});
+    }
   };
 
   if (!joined) {

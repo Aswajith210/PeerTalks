@@ -8,6 +8,7 @@ import { useToast } from "@/hooks/useToast";
 import { motion } from "framer-motion";
 import { createClient } from "@/lib/supabase/client";
 import { useState, useEffect } from "react";
+import { Button } from "@/components/ui/Button";
 
 function SettingsContent() {
   const { user } = useAuth();
@@ -113,13 +114,9 @@ function SettingsContent() {
             <p className="text-xs text-muted mt-1.5 text-right">{bio.length}/160</p>
           </div>
           <div className="pt-2">
-            <button
-              onClick={handleSave}
-              disabled={saving}
-              className="h-11 px-6 rounded-xl bg-white/10 text-sm font-medium text-white/80 hover:bg-white/15 hover:text-white disabled:opacity-40 disabled:pointer-events-none transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/15"
-            >
-              {saving ? "Saving..." : "Save changes"}
-            </button>
+            <Button variant="secondary" size="md" loading={saving} onClick={handleSave}>
+              Save changes
+            </Button>
           </div>
         </div>
       </motion.section>
@@ -134,16 +131,17 @@ function SettingsContent() {
         <p className="text-sm text-muted mb-5 leading-relaxed">
           Signed in as <span className="text-white/60">{user?.email}</span>
         </p>
-        <button
+        <Button
+          variant="danger"
+          size="md"
           onClick={async () => {
             const supabase = await createClient();
             if (supabase) await supabase.auth.signOut();
             window.location.href = "/login";
           }}
-          className="h-11 px-6 rounded-xl bg-error-soft text-sm font-medium text-error hover:bg-error/15 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error/30"
         >
           Sign out
-        </button>
+        </Button>
       </motion.section>
     </div>
   );
