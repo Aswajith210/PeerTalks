@@ -28,18 +28,24 @@ function InterestChatContent() {
   const subscriptionRef = useRef<RealtimeChannel | null>(null);
 
   useEffect(() => {
-    const client = createClient() as unknown as SupabaseClient | null;
-    if (client) supabaseRef.current = client;
+    createClient().then((client) => {
+      supabaseRef.current = client as unknown as SupabaseClient | null;
+    });
+  }, []);
+
+  const unsubscribeMatching = useCallback(() => {
+    if (subscriptionRef.current && supabaseRef.current) {
+      supabaseRef.current.removeChannel(subscriptionRef.current);
+      subscriptionRef.current = null;
+    }
   }, []);
 
   useEffect(() => {
     return () => {
-      if (subscriptionRef.current && supabaseRef.current) {
-        supabaseRef.current.removeChannel(subscriptionRef.current);
-      }
+      unsubscribeMatching();
       fetch("/api/matching/interest", { method: "DELETE" }).catch(() => {});
     };
-  }, []);
+  }, [unsubscribeMatching]);
 
   const toggleInterest = (interest: string) => {
     setInterests((prev) =>
@@ -65,6 +71,7 @@ function InterestChatContent() {
 
     setStatus("matching");
     setError(null);
+    unsubscribeMatching();
 
     try {
       const res = await fetch("/api/matching/interest", {
@@ -93,8 +100,8 @@ function InterestChatContent() {
       const userId = session?.user.id;
       if (!userId) return;
 
-      subscriptionRef.current = supabase
-        .channel("interest_matching_update")
+      const channel = supabase
+        .channel(`interest_matching_${userId}`)
         .on(
           "postgres_changes",
           {
@@ -112,11 +119,19 @@ function InterestChatContent() {
           }
         )
         .subscribe();
+
+      subscriptionRef.current = channel;
     } catch {
       setError("Something went wrong. Please try again.");
       setStatus("select");
     }
-  }, [interests, router]);
+  }, [interests, router, unsubscribeMatching]);
+
+  const cancelMatching = useCallback(async () => {
+    unsubscribeMatching();
+    await fetch("/api/matching/interest", { method: "DELETE" }).catch(() => {});
+    setStatus("select");
+  }, [unsubscribeMatching]);
 
   return (
     <div className="min-h-screen flex items-center justify-center px-4 pt-16">
@@ -229,10 +244,7 @@ function InterestChatContent() {
                 ))}
               </div>
               <button
-                onClick={async () => {
-                  await fetch("/api/matching/interest", { method: "DELETE" });
-                  setStatus("select");
-                }}
+                onClick={cancelMatching}
                 className="text-xs text-white/30 hover:text-white/60 transition-colors"
               >
                 Cancel

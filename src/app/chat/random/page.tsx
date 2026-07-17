@@ -41,13 +41,22 @@ function RandomChatContent() {
   const subscriptionRef = useRef<RealtimeChannel | null>(null);
 
   useEffect(() => {
-    const client = createClient() as unknown as SupabaseClient | null;
-    if (client) supabaseRef.current = client;
+    createClient().then((client) => {
+      supabaseRef.current = client as unknown as SupabaseClient | null;
+    });
+  }, []);
+
+  const unsubscribeMatching = useCallback(() => {
+    if (subscriptionRef.current && supabaseRef.current) {
+      supabaseRef.current.removeChannel(subscriptionRef.current);
+      subscriptionRef.current = null;
+    }
   }, []);
 
   const startMatching = useCallback(async () => {
     setStatus("matching");
     setMatchError(null);
+    unsubscribeMatching();
 
     try {
       const res = await fetch("/api/matching/random", { method: "POST" });
@@ -74,9 +83,10 @@ function RandomChatContent() {
 
       const { data: { session } } = await supabase.auth.getSession();
       const userId = session?.user.id;
+      if (!userId) return;
 
-      subscriptionRef.current = supabase
-        .channel("matching_update")
+      const channel = supabase
+        .channel(`matching_update_${userId}`)
         .on(
           "postgres_changes",
           {
@@ -94,20 +104,26 @@ function RandomChatContent() {
           }
         )
         .subscribe();
+
+      subscriptionRef.current = channel;
     } catch {
       setMatchError("Something went wrong. Please try again.");
       setStatus("select");
     }
-  }, [router]);
+  }, [router, unsubscribeMatching]);
+
+  const cancelMatching = useCallback(async () => {
+    unsubscribeMatching();
+    await fetch("/api/matching/random", { method: "DELETE" }).catch(() => {});
+    setStatus("select");
+  }, [unsubscribeMatching]);
 
   useEffect(() => {
     return () => {
-      if (subscriptionRef.current && supabaseRef.current) {
-        supabaseRef.current.removeChannel(subscriptionRef.current);
-      }
+      unsubscribeMatching();
       fetch("/api/matching/random", { method: "DELETE" }).catch(() => {});
     };
-  }, []);
+  }, [unsubscribeMatching]);
 
   return (
     <div className="min-h-screen flex items-center justify-center px-4 pt-16">
@@ -157,10 +173,7 @@ function RandomChatContent() {
             <div className="glass-card rounded-3xl p-10 text-center">
               <MatchingAnimation />
               <button
-                onClick={async () => {
-                  await fetch("/api/matching/random", { method: "DELETE" });
-                  setStatus("select");
-                }}
+                onClick={cancelMatching}
                 className="mt-6 text-xs text-white/30 hover:text-white/60 transition-colors"
               >
                 Cancel

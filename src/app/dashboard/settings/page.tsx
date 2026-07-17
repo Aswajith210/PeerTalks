@@ -9,17 +9,9 @@ import { motion } from "framer-motion";
 import { createClient } from "@/lib/supabase/client";
 import { useState, useEffect } from "react";
 
-interface Profile {
-  username?: string;
-  display_name?: string;
-  bio?: string;
-  avatar_url?: string;
-}
-
 function SettingsContent() {
   const { user } = useAuth();
   const toast = useToast();
-  const [profile, setProfile] = useState<Profile | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [displayName, setDisplayName] = useState("");
@@ -32,11 +24,10 @@ function SettingsContent() {
       if (!supabase) return;
       const { data } = await supabase
         .from("profiles")
-        .select("username, display_name, bio, avatar_url")
+        .select("display_name, bio")
         .eq("id", user.id)
         .single();
       if (data) {
-        setProfile(data);
         setDisplayName(data.display_name || "");
         setBio(data.bio || "");
       }

@@ -1,67 +1,15 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
-import { createClient } from "@/lib/supabase/client";
-import type { RealtimeChannel } from "@supabase/supabase-js";
+import { useTokens } from "@/hooks/useTokens";
 
 interface TokenBalanceProps {
   className?: string;
 }
 
 export function TokenBalance({ className = "" }: TokenBalanceProps) {
-  const [balance, setBalance] = useState<number | null>(null);
-  const channelRef = useRef<RealtimeChannel | null>(null);
+  const { balance, loading } = useTokens();
 
-  useEffect(() => {
-    let mounted = true;
-
-    const init = async () => {
-      const supabase = await createClient();
-      if (!supabase) return;
-
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session || !mounted) return;
-
-      const { data } = await supabase
-        .from("token_balances")
-        .select("balance")
-        .eq("user_id", session.user.id)
-        .single();
-
-      if (mounted && data) setBalance(data.balance);
-
-      const channel = supabase
-        .channel("token_balance")
-        .on(
-          "postgres_changes",
-          {
-            event: "*",
-            schema: "public",
-            table: "token_balances",
-            filter: `user_id=eq.${session.user.id}`,
-          },
-          (payload: { new?: Record<string, unknown> }) => {
-            if (payload.new && "balance" in payload.new) {
-              setBalance(payload.new.balance as number);
-            }
-          }
-        )
-        .subscribe();
-
-      if (mounted) channelRef.current = channel;
-    };
-
-    init();
-
-    return () => {
-      mounted = false;
-      if (channelRef.current) {
-        createClient().then((sb) => sb?.removeChannel(channelRef.current!));
-      }
-    };
-  }, []);
-
-  if (balance === null) return null;
+  if (loading || balance === 0) return null;
 
   return (
     <div className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.08] ${className}`}>

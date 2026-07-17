@@ -9,72 +9,82 @@ export async function GET(request: Request) {
 
   if (code) {
     const cookieStore = await cookies();
-    const supabase = createServerClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-      {
-        cookies: {
-          getAll() {
-            return cookieStore.getAll();
-          },
-          setAll(cookiesToSet) {
-            try {
-              cookiesToSet.forEach(({ name, value, options }) =>
-                cookieStore.set(name, value, options)
-              );
-            } catch {}
-          },
+
+    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+    if (!supabaseUrl || !supabaseKey) {
+      console.error("[AUTH] Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY");
+      return NextResponse.redirect(`${origin}?error=missing_config`);
+    }
+
+    const supabase = createServerClient(supabaseUrl, supabaseKey, {
+      cookies: {
+        getAll() {
+          return cookieStore.getAll();
         },
-      }
-    );
+        setAll(cookiesToSet) {
+          try {
+            cookiesToSet.forEach(({ name, value, options }) =>
+              cookieStore.set(name, value, options)
+            );
+          } catch (e) {
+            console.error("[AUTH] Cookie set error:", e);
+          }
+        },
+      },
+    });
 
     const { error } = await supabase.auth.exchangeCodeForSession(code);
 
-    if (!error) {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
+    if (error) {
+      console.error("[AUTH] exchangeCodeForSession failed:", JSON.stringify(error));
+      return NextResponse.redirect(`${origin}?error=${encodeURIComponent(error.message || "exchange_failed")}`);
+    }
 
-      if (session?.user) {
-        const { data: profile } = await supabase
-          .from("profiles")
-          .select("id")
-          .eq("id", session.user.id)
-          .single();
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
 
-        if (!profile) {
-          await supabase.from("profiles").insert({
-            id: session.user.id,
-            username: session.user.user_metadata?.email?.split("@")[0],
-            display_name: session.user.user_metadata?.full_name,
-            avatar_url: session.user.user_metadata?.avatar_url,
-          });
-        }
+    if (session?.user) {
+      const { data: profile } = await supabase
+        .from("profiles")
+        .select("id")
+        .eq("id", session.user.id)
+        .single();
 
-        const { data: balance } = await supabase
-          .from("token_balances")
-          .select("user_id")
-          .eq("user_id", session.user.id)
-          .single();
-
-        if (!balance) {
-          await supabase.from("token_balances").insert({
-            user_id: session.user.id,
-            balance: 20,
-            last_daily_at: new Date().toISOString(),
-          });
-          await supabase.from("token_transactions").insert({
-            user_id: session.user.id,
-            amount: 20,
-            type: "daily_allowance",
-            description: "Welcome bonus",
-          });
-        }
+      if (!profile) {
+        await supabase.from("profiles").insert({
+          id: session.user.id,
+          username: session.user.user_metadata?.email?.split("@")[0],
+          display_name: session.user.user_metadata?.full_name,
+          avatar_url: session.user.user_metadata?.avatar_url,
+        });
       }
 
-      return NextResponse.redirect(`${origin}${next}`);
+      const { data: balance } = await supabase
+        .from("token_balances")
+        .select("user_id")
+        .eq("user_id", session.user.id)
+        .single();
+
+      if (!balance) {
+        await supabase.from("token_balances").insert({
+          user_id: session.user.id,
+          balance: 20,
+          last_daily_at: new Date().toISOString(),
+        });
+        await supabase.from("token_transactions").insert({
+          user_id: session.user.id,
+          amount: 20,
+          type: "daily_allowance",
+          description: "Welcome bonus",
+        });
+      }
     }
+
+    return NextResponse.redirect(`${origin}${next}`);
   }
 
-  return NextResponse.redirect(`${origin}?error=auth_failed`);
+  return NextResponse.redirect(`${origin}?error=no_code`);
 }

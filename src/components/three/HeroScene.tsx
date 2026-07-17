@@ -112,6 +112,17 @@ function Particles() {
   );
 }
 
+function StudioEnvironment() {
+  return (
+    <Environment resolution={128}>
+      <mesh>
+        <sphereGeometry args={[5, 32, 32]} />
+        <meshBasicMaterial color="#222226" side={THREE.BackSide} />
+      </mesh>
+    </Environment>
+  );
+}
+
 function Lighting() {
   return (
     <>
@@ -132,7 +143,7 @@ export function HeroScene() {
           <Lighting />
           <FloatingObjects />
           <Particles />
-          <Environment preset="studio" />
+          <StudioEnvironment />
         </Suspense>
       </Canvas>
     </div>

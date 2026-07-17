@@ -7,7 +7,7 @@ import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState, useRef, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
 import type { Message } from "@/types/database";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { SupabaseClient, RealtimeChannel } from "@supabase/supabase-js";
 import { VideoCard, FloatingPreview, CallControls, JoinScreen, ReactionOverlay, useReactions } from "@/components/video";
 import Icons from "@/components/icons/icons";
 import { startLocalStream, stopLocalStream, toggleTrack } from "@/lib/webrtc/peerConnection";
@@ -30,12 +30,14 @@ function ChatRoomContent() {
   const supabaseRef = useRef<SupabaseClient | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const msgChannelRef = useRef<RealtimeChannel | null>(null);
   const { reactionsRef, addReaction } = useReactions();
   const [reactions, setReactions] = useState<{ id: string; icon: import("@/components/icons/icons").IconName }[]>([]);
 
   useEffect(() => {
-    const client = createClient() as unknown as SupabaseClient | null;
-    if (client) supabaseRef.current = client;
+    createClient().then((client) => {
+      supabaseRef.current = client as unknown as SupabaseClient | null;
+    });
   }, []);
 
   const getSupabase = () => supabaseRef.current;
@@ -50,6 +52,8 @@ function ChatRoomContent() {
 
   useEffect(() => {
     if (!joined) return;
+    let cancelled = false;
+
     const init = async () => {
       const supabase = getSupabase();
       if (!supabase) return;
@@ -59,15 +63,15 @@ function ChatRoomContent() {
         .select("*")
         .eq("session_id", id)
         .order("created_at", { ascending: true });
-      setMessages(msgs ?? []);
+      if (!cancelled) setMessages(msgs ?? []);
     };
     init();
 
     const setupRealtime = async () => {
       const supabase = getSupabase();
-      if (!supabase) return;
+      if (!supabase || cancelled) return;
 
-      const msgSub = supabase
+      const channel = supabase
         .channel(`messages:${id}`)
         .on(
           "postgres_changes",
@@ -83,28 +87,40 @@ function ChatRoomContent() {
         )
         .subscribe();
 
-      return () => {
-        supabase.removeChannel(msgSub);
-      };
+      if (!cancelled) {
+        msgChannelRef.current = channel;
+      } else {
+        supabase.removeChannel(channel);
+      }
     };
 
-    const cleanup = setupRealtime();
+    setupRealtime();
+
     return () => {
-      cleanup.then((fn) => fn?.());
+      cancelled = true;
+      if (msgChannelRef.current && supabaseRef.current) {
+        supabaseRef.current.removeChannel(msgChannelRef.current);
+        msgChannelRef.current = null;
+      }
     };
   }, [id, joined]);
 
   useEffect(() => {
+    let cancelled = false;
+
     const startMedia = async () => {
       try {
         const stream = await startLocalStream({ video: true, audio: true });
-        setLocalStream(stream);
-        localStreamRef.current = stream;
+        if (!cancelled) {
+          setLocalStream(stream);
+          localStreamRef.current = stream;
+        }
       } catch {}
     };
     startMedia();
 
     return () => {
+      cancelled = true;
       stopLocalStream(localStreamRef.current);
       pcRef.current?.close();
     };

@@ -2,7 +2,7 @@
 
 import { createClient } from "@/lib/supabase/client";
 import { useState, useCallback, useEffect, useRef } from "react";
-import type { RealtimeChannel } from "@supabase/supabase-js";
+import type { RealtimeChannel, SupabaseClient } from "@supabase/supabase-js";
 
 interface TokenState {
   balance: number;
@@ -17,20 +17,23 @@ export function useTokens() {
     error: null,
   });
   const channelRef = useRef<RealtimeChannel | null>(null);
+  const supabaseRef = useRef<SupabaseClient | null>(null);
+  const mountedRef = useRef(false);
 
   useEffect(() => {
-    let mounted = true;
+    mountedRef.current = true;
 
     const init = async () => {
       const supabase = await createClient();
-      if (!supabase) {
-        if (mounted) setState((s) => ({ ...s, loading: false }));
+      if (!supabase || !mountedRef.current) {
+        if (mountedRef.current) setState((s) => ({ ...s, loading: false }));
         return;
       }
+      supabaseRef.current = supabase;
 
       const { data: { session } } = await supabase.auth.getSession();
-      if (!session) {
-        if (mounted) setState((s) => ({ ...s, loading: false }));
+      if (!session || !mountedRef.current) {
+        if (mountedRef.current) setState((s) => ({ ...s, loading: false }));
         return;
       }
 
@@ -40,7 +43,7 @@ export function useTokens() {
         .eq("user_id", session.user.id)
         .single();
 
-      if (mounted) {
+      if (mountedRef.current) {
         if (error) {
           setState({ balance: 0, loading: false, error: error.message });
         } else {
@@ -59,35 +62,36 @@ export function useTokens() {
             filter: `user_id=eq.${session.user.id}`,
           },
           (payload: { new?: Record<string, unknown> }) => {
-            if (payload.new && "balance" in payload.new) {
-              if (mounted) {
-                setState((s) => ({
-                  ...s,
-                  balance: payload.new!.balance as number,
-                }));
-              }
+            if (payload.new && "balance" in payload.new && mountedRef.current) {
+              setState((s) => ({
+                ...s,
+                balance: payload.new!.balance as number,
+              }));
             }
           }
         )
         .subscribe();
 
-      if (mounted) channelRef.current = channel;
+      if (mountedRef.current) {
+        channelRef.current = channel;
+      } else {
+        supabase.removeChannel(channel);
+      }
     };
 
     init();
 
     return () => {
-      mounted = false;
-      if (channelRef.current) {
-        createClient().then((sb) => sb?.removeChannel(channelRef.current!));
+      mountedRef.current = false;
+      if (channelRef.current && supabaseRef.current) {
+        supabaseRef.current.removeChannel(channelRef.current);
+        channelRef.current = null;
       }
     };
   }, []);
 
   const hasEnough = useCallback(
-    (amount: number) => {
-      return state.balance >= amount;
-    },
+    (amount: number) => state.balance >= amount,
     [state.balance]
   );
 
