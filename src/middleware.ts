@@ -48,32 +48,42 @@ export async function middleware(request: NextRequest) {
     }
   }
 
-  // Supabase session refresh
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-
-  if (!supabaseUrl || !supabaseKey) {
-    return NextResponse.next({ request });
-  }
+  // Supabase session refresh.
+  // NOTE: the OAuth callback path must NOT touch the session here — the fresh
+  // authorization code is exchanged exactly once by the route handler, and any
+  // concurrent getUser()/cookie writes in middleware would corrupt that state
+  // (flow_state_already_used after Google account selection).
+  const isAuthCallback = pathname.startsWith("/api/auth/callback");
 
   let supabaseResponse = NextResponse.next({ request });
 
-  const supabase = createServerClient(supabaseUrl, supabaseKey, {
-    cookies: {
-      getAll() {
-        return request.cookies.getAll();
-      },
-      setAll(cookiesToSet) {
-        cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value));
-        supabaseResponse = NextResponse.next({ request });
-        cookiesToSet.forEach(({ name, value, options }) =>
-          supabaseResponse.cookies.set(name, value, options)
-        );
-      },
-    },
-  });
+  if (!isAuthCallback) {
+    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
-  await supabase.auth.getUser();
+    if (!supabaseUrl || !supabaseKey) {
+      return NextResponse.next({ request });
+    }
+
+    supabaseResponse = NextResponse.next({ request });
+
+    const supabase = createServerClient(supabaseUrl, supabaseKey, {
+      cookies: {
+        getAll() {
+          return request.cookies.getAll();
+        },
+        setAll(cookiesToSet) {
+          cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value));
+          supabaseResponse = NextResponse.next({ request });
+          cookiesToSet.forEach(({ name, value, options }) =>
+            supabaseResponse.cookies.set(name, value, options)
+          );
+        },
+      },
+    });
+
+    await supabase.auth.getUser();
+  }
 
   // Apply security headers
   const headers = new Headers(supabaseResponse.headers);
