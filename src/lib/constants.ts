@@ -11,7 +11,15 @@ export const TOKEN_ALLOWANCE = {
 
 export const MATCHING_TIMEOUT_MS = 120_000;
 
-export const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3001";
+const envSiteUrl = process.env.NEXT_PUBLIC_SITE_URL;
+const SITE_URL_FALLBACK = "https://peer-talks-three.vercel.app";
+
+export const SITE_URL =
+  envSiteUrl &&
+  /^https?:\/\//.test(envSiteUrl) &&
+  !/localhost|127\.0\.0\.1/.test(envSiteUrl)
+    ? envSiteUrl.replace(/\/+$/, "")
+    : SITE_URL_FALLBACK;
 
 export const SITE_NAME = "PeerTalks";
 export const SITE_DESCRIPTION =
