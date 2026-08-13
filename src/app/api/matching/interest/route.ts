@@ -36,6 +36,7 @@ export async function POST(request: Request) {
 
   const { interests } = body;
   const userId = session.user.id;
+  console.log("[PeerTalks][Auth] interest POST", { userId });
 
   // Save interests
   for (const interest of interests) {
@@ -61,6 +62,20 @@ export async function POST(request: Request) {
     });
     return NextResponse.json({ error: "Insufficient tokens", balance: deduction.balance, reason: deduction.reason }, { status: 400 });
   }
+  console.log("[PeerTalks][Queue] deduction done", {
+    userId, idempotent: deduction.idempotent, balance: deduction.balance,
+  });
+
+  // A replayed request (same idempotency key, e.g. our client's waiting
+  // poll) must not stack a second waiting row for this user.
+  if (deduction.idempotent) {
+    await supabase
+      .from("matching_queue")
+      .delete()
+      .eq("user_id", userId)
+      .eq("mode", "interest")
+      .eq("status", "waiting");
+  }
 
   let matchResult: Record<string, unknown> | null = null;
 
@@ -68,6 +83,10 @@ export async function POST(request: Request) {
   const rpcResult = await supabase.rpc("find_interest_match", { p_user_id: userId, p_interests: interests, p_call_type: callType });
   const rpcData = rpcResult.data as Record<string, unknown> | null;
   const rpcErr = rpcResult.error;
+  console.log("[PeerTalks][Match RPC] find_interest_match", {
+    userId, callType, interests, matched: rpcData?.matched ?? false, data: rpcData,
+    error: rpcErr ? { code: rpcErr.code, message: rpcErr.message } : null,
+  });
 
   if (rpcData?.matched) {
     matchResult = rpcData;
@@ -119,6 +138,9 @@ export async function POST(request: Request) {
   }
 
   if (matchResult?.matched) {
+    console.log("[PeerTalks][Session] matched via RPC", {
+      userId, sessionId: matchResult.session_id, peerId: matchResult.peer_id,
+    });
     return NextResponse.json({
       matched: true,
       sessionId: matchResult.session_id as string,
@@ -131,6 +153,10 @@ export async function POST(request: Request) {
     .from("matching_queue")
     .insert({ user_id: userId, mode: "interest", call_type: callType, interests, status: "waiting" })
     .select().single();
+
+  console.log("[PeerTalks][Queue] waiting row", {
+    userId, queueId: queueEntry?.id ?? null, insertFailed: !queueEntry,
+  });
 
   return NextResponse.json({
     matched: false,
@@ -145,6 +171,7 @@ export async function DELETE() {
   if (!supabase) return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
   const { data: { session } } = await supabase.auth.getSession();
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  console.log("[PeerTalks][Auth] interest DELETE", { userId: session.user.id });
 
   // Refund ONLY when a waiting entry was actually removed (see random route).
   const { data: deleted } = await supabase

@@ -36,6 +36,7 @@ export async function POST(request: Request) {
   }
 
   const userId = session.user.id;
+  console.log("[PeerTalks][Auth] random POST", { userId });
 
   // Clear orphaned waiting rows from attempts whose response was lost
   // (e.g. a retried POST that queued but never got a reply). Rows newer
@@ -55,6 +56,21 @@ export async function POST(request: Request) {
     });
     return NextResponse.json({ error: "Insufficient tokens", balance: deduction.balance, reason: deduction.reason }, { status: 400 });
   }
+  console.log("[PeerTalks][Queue] deduction done", {
+    userId, idempotent: deduction.idempotent, balance: deduction.balance,
+  });
+
+  // A replayed request (same idempotency key, e.g. our client's waiting
+  // poll) must not stack a second waiting row for this user — drop the
+  // stale one so the RPC matches fresh rows only.
+  if (deduction.idempotent) {
+    await supabase
+      .from("matching_queue")
+      .delete()
+      .eq("user_id", userId)
+      .eq("mode", "random")
+      .eq("status", "waiting");
+  }
 
   let matchResult: Record<string, unknown> | null = null;
 
@@ -62,6 +78,10 @@ export async function POST(request: Request) {
   const rpcResult = await supabase.rpc("find_random_match", { p_user_id: userId, p_call_type: callType });
   const rpcData = rpcResult.data as Record<string, unknown> | null;
   const rpcErr = rpcResult.error;
+  console.log("[PeerTalks][Match RPC] find_random_match", {
+    userId, callType, matched: rpcData?.matched ?? false, data: rpcData,
+    error: rpcErr ? { code: rpcErr.code, message: rpcErr.message } : null,
+  });
 
   if (rpcData?.matched) {
     matchResult = rpcData;
@@ -106,6 +126,9 @@ export async function POST(request: Request) {
   }
 
   if (matchResult?.matched) {
+    console.log("[PeerTalks][Session] matched via RPC", {
+      userId, sessionId: matchResult.session_id, peerId: matchResult.peer_id,
+    });
     return NextResponse.json({
       matched: true,
       sessionId: matchResult.session_id as string,
@@ -118,6 +141,10 @@ export async function POST(request: Request) {
     .from("matching_queue")
     .insert({ user_id: userId, mode: "random", call_type: callType, status: "waiting" })
     .select().single();
+
+  console.log("[PeerTalks][Queue] waiting row", {
+    userId, queueId: queueEntry?.id ?? null, insertFailed: !queueEntry,
+  });
 
   if (queueEntry) {
     return NextResponse.json({
@@ -136,6 +163,7 @@ export async function DELETE() {
   if (!supabase) return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
   const { data: { session } } = await supabase.auth.getSession();
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  console.log("[PeerTalks][Auth] random DELETE", { userId: session.user.id });
 
   // Refund ONLY when a waiting queue entry was actually removed. A user who
   // already matched (entry status=matched) or already cancelled (no row)

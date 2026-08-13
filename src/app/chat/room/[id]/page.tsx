@@ -318,6 +318,7 @@ function ChatRoomContent() {
     channel.on("broadcast", { event: "signal" }, async (payload) => {
       const signal = payload.payload as { type: string; sdp?: string; candidate?: RTCIceCandidateInit };
       if (signal.type === "offer") {
+        console.log("[PeerTalks][WebRTC] offer received");
         try {
           if (pc.signalingState !== "have-local-offer") {
             await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: signal.sdp! }));
@@ -328,6 +329,7 @@ function ChatRoomContent() {
           }
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
+          console.log("[PeerTalks][WebRTC] answer sent");
           await channel.send({
             type: "broadcast",
             event: "signal",
@@ -338,6 +340,7 @@ function ChatRoomContent() {
         }
       } else if (signal.type === "answer") {
         try {
+          console.log("[PeerTalks][WebRTC] answer received");
           if (pc.signalingState !== "stable") {
             await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: signal.sdp! }));
           }
@@ -387,6 +390,7 @@ function ChatRoomContent() {
               event: "signal",
               payload: { type: "offer", sdp: offer.sdp! },
             });
+            console.log("[PeerTalks][WebRTC] offer sent");
           }
         } catch (e) {
           console.error("[signaling] Failed to create/send offer:", e);
@@ -432,6 +436,7 @@ function ChatRoomContent() {
 
       pc.onconnectionstatechange = () => {
         setConnectionState(pc.connectionState);
+        console.log("[PeerTalks][WebRTC] connection state", pc.connectionState);
         if (pc.connectionState === "connected") {
           setPeerLeft(false);
           if (offerTimerRef.current) {

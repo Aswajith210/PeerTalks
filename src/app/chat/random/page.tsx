@@ -42,6 +42,7 @@ function RandomChatContent() {
   const supabaseRef = useRef<SupabaseClient | null>(null);
   const subscriptionRef = useRef<RealtimeChannel | null>(null);
   const matchingRef = useRef(false);
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     createClient().then((client) => {
@@ -56,12 +57,20 @@ function RandomChatContent() {
     }
   }, []);
 
+  const clearMatchingTimers = useCallback(() => {
+    if (pollTimerRef.current) {
+      clearInterval(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+  }, []);
+
   const startMatching = useCallback(async (callType: "video" | "text" = "video") => {
     if (matchingRef.current) return;
     matchingRef.current = true;
     setStatus("matching");
     setMatchError(null);
     unsubscribeMatching();
+    clearMatchingTimers();
 
     try {
       const supabase = supabaseRef.current;
@@ -74,7 +83,13 @@ function RandomChatContent() {
 
       const { data: { session } } = await supabase.auth.getSession();
       const userId = session?.user.id;
-      if (!userId) return;
+      if (!userId) {
+        setMatchError("Not signed in");
+        setStatus("select");
+        matchingRef.current = false;
+        return;
+      }
+      console.log("[PeerTalks][Auth] random startMatching", { userId, callType });
 
       const channel = supabase
         .channel(`matching_update_${userId}`)
@@ -89,51 +104,79 @@ function RandomChatContent() {
           (payload: { new: Record<string, unknown> }) => {
             const newData = payload.new as Record<string, unknown>;
             if (newData && newData.status === "matched" && newData.session_id) {
+              console.log("[PeerTalks][Realtime] matched event", { sessionId: newData.session_id });
               setStatus("connected");
+              clearMatchingTimers();
               setTimeout(() => router.push(`/chat/room/${newData.session_id}`), 500);
             }
           }
         )
-        .subscribe();
+        .subscribe((status) => {
+          console.log("[PeerTalks][Realtime] channel status", { status });
+        });
 
       subscriptionRef.current = channel;
 
-      const res = await fetch("/api/matching/random", {
-        method: "POST",
-        headers: {
-          "x-call-type": callType,
-          "x-request-id": globalThis.crypto.randomUUID(),
-        },
-      });
-      const data = await res.json();
+      // One idempotency key for the whole attempt: re-polling with the same
+      // key can never charge the user twice.
+      const requestKey = globalThis.crypto.randomUUID();
 
-      if (!res.ok) {
-        console.error("[tokens] random chat POST rejected", {
-          userId, cost: 2, status: res.status, body: data,
+      const attemptMatch = async (): Promise<boolean> => {
+        const res = await fetch("/api/matching/random", {
+          method: "POST",
+          headers: {
+            "x-call-type": callType,
+            "x-request-id": requestKey,
+          },
         });
-        setMatchError(data.error || "Failed to start matching");
-        setStatus("select");
-        matchingRef.current = false;
-        return;
-      }
+        const data = await res.json();
+        if (typeof data.balance === "number") setBalance(data.balance);
+        void refresh();
 
-      if (typeof data.balance === "number") setBalance(data.balance);
-      await refresh();
+        if (!res.ok) {
+          console.warn("[PeerTalks][Match RPC] POST rejected", {
+            userId, status: res.status, body: data,
+          });
+          return false;
+        }
 
-      if (data.matched && data.sessionId) {
-        setStatus("connected");
-        setTimeout(() => router.push(`/chat/room/${data.sessionId}`), 800);
-        return;
-      }
+        if (data.matched && data.sessionId) {
+          console.log("[PeerTalks][Session] matched via response", { sessionId: data.sessionId });
+          setStatus("connected");
+          clearMatchingTimers();
+          setTimeout(() => router.push(`/chat/room/${data.sessionId}`), 800);
+          return true;
+        }
+
+        console.log("[PeerTalks][Queue] waiting, no match yet", { userId });
+        return false;
+      };
+
+      const matchedNow = await attemptMatch();
+      if (matchedNow) return;
+
+      // The RPC only pairs users when it runs, so two people who join at the
+      // same moment would otherwise wait forever. Poll with the same key
+      // (idempotent — no double charge) until matched, cancelled or timeout.
+      pollTimerRef.current = setInterval(async () => {
+        if (!matchingRef.current) {
+          clearMatchingTimers();
+          return;
+        }
+        const hit = await attemptMatch();
+        if (hit) clearMatchingTimers();
+      }, 4000);
     } catch {
       setMatchError("Something went wrong. Please try again.");
       setStatus("select");
       matchingRef.current = false;
+      clearMatchingTimers();
     }
-  }, [router, unsubscribeMatching, refresh, setBalance]);
+  }, [router, unsubscribeMatching, refresh, setBalance, clearMatchingTimers]);
 
   const cancelMatching = useCallback(async () => {
     matchingRef.current = false;
+    clearMatchingTimers();
     unsubscribeMatching();
     const res = await fetch("/api/matching/random", { method: "DELETE" }).catch(() => null);
     if (res) {
@@ -142,14 +185,15 @@ function RandomChatContent() {
     }
     await refresh();
     setStatus("select");
-  }, [unsubscribeMatching, refresh, setBalance]);
+  }, [unsubscribeMatching, refresh, setBalance, clearMatchingTimers]);
 
   useEffect(() => {
     return () => {
       unsubscribeMatching();
+      clearMatchingTimers();
       fetch("/api/matching/random", { method: "DELETE" }).catch(() => {});
     };
-  }, [unsubscribeMatching]);
+  }, [unsubscribeMatching, clearMatchingTimers]);
 
   return (
     <div className="min-h-screen flex items-center justify-center px-4 pt-16">
