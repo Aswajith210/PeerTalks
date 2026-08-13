@@ -53,22 +53,80 @@ export async function POST(request: Request) {
     );
   }
 
-  // Use security definer RPC to assign guest + manage chat session
+  // Try RPC first (security definer bypasses RLS)
   const { data: joinResult, error: joinError } = await supabase
     .rpc("join_private_room_as_guest", {
       p_room_id: room.id,
       p_guest_id: session.user.id,
     });
 
-  if (joinError || !joinResult?.success) {
-    return NextResponse.json(
-      { error: joinResult?.error || "Failed to join room" },
-      { status: 500 }
-    );
+  if (!joinError && joinResult?.success) {
+    return NextResponse.json({
+      room,
+      session: { id: joinResult.session_id },
+    });
+  }
+
+  // RPC failed or not available — fallback to direct updates
+  if (joinError) {
+    // Only fallback for "function not found"; other errors are real failures
+    if (joinError.code !== "PGRST202") {
+      return NextResponse.json(
+        { error: "Failed to join room" },
+        { status: 500 }
+      );
+    }
+  }
+
+  // Fallback: direct update
+  const { error: updateError } = await supabase
+    .from("private_rooms")
+    .update({ guest_id: session.user.id })
+    .eq("id", room.id)
+    .eq("is_active", true)
+    .is("guest_id", null);
+
+  if (updateError) {
+    return NextResponse.json({ error: "Failed to join room" }, { status: 500 });
+  }
+
+  // Find or create chat session
+  const { data: existingSession } = await supabase
+    .from("chat_sessions")
+    .select("id")
+    .eq("room_id", room.id.toString())
+    .eq("status", "waiting")
+    .maybeSingle();
+
+  let sessionId: string;
+
+  if (existingSession) {
+    const { data: updated } = await supabase
+      .from("chat_sessions")
+      .update({ status: "connected", user2_id: session.user.id })
+      .eq("id", existingSession.id)
+      .select("id")
+      .single();
+    sessionId = updated?.id ?? existingSession.id;
+  } else {
+    const { data: newSession } = await supabase
+      .from("chat_sessions")
+      .insert({
+        mode: "private_room", status: "connected",
+        user1_id: room.host_id, user2_id: session.user.id,
+        room_id: room.id.toString(),
+      })
+      .select("id")
+      .single();
+    sessionId = newSession?.id;
+  }
+
+  if (!sessionId) {
+    return NextResponse.json({ error: "Failed to create chat session" }, { status: 500 });
   }
 
   return NextResponse.json({
     room,
-    session: { id: joinResult.session_id },
+    session: { id: sessionId },
   });
 }

@@ -12,6 +12,7 @@ interface JoinScreenProps {
   onToggleVideo: () => void;
   onJoin: () => void;
   isJoining: boolean;
+  mediaError?: string | null;
 }
 
 function MediaToggle({ enabled, onToggle, label, icon }: {
@@ -44,6 +45,7 @@ export function JoinScreen({
   onToggleVideo,
   onJoin,
   isJoining,
+  mediaError,
 }: JoinScreenProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
@@ -83,6 +85,17 @@ export function JoinScreen({
                   <path d="M18 10l4-2.5v9L18 14" />
                   <path d="M3 3l18 18" opacity={0.5} />
                 </svg>
+              </div>
+            )}
+
+            {mediaError && (
+              <div className="absolute inset-0 bg-black/80 backdrop-blur-sm flex flex-col items-center justify-center gap-3 px-6 text-center">
+                <div className="w-10 h-10 rounded-full bg-error-soft border border-error/20 flex items-center justify-center">
+                  <svg className="w-5 h-5 text-error/70" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
+                    <path d="M12 9v4M12 17h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                  </svg>
+                </div>
+                <p className="text-xs text-white/60 leading-relaxed">{mediaError}</p>
               </div>
             )}
           </div>

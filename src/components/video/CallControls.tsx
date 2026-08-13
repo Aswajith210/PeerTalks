@@ -10,6 +10,10 @@ interface CallControlsProps {
   onEndCall: () => void;
   onToggleChat: () => void;
   onReaction: (type: string) => void;
+  onNext: () => void;
+  onFullscreen: () => void;
+  onReport: () => void;
+  onBlock: () => void;
   showChat: boolean;
 }
 
@@ -55,12 +59,16 @@ export function CallControls({
   onEndCall,
   onToggleChat,
   onReaction,
+  onNext,
+  onFullscreen,
+  onReport,
+  onBlock,
   showChat,
 }: CallControlsProps) {
   const [visible, setVisible] = useState(true);
   const [showMore, setShowMore] = useState(false);
+  const [showReactions, setShowReactions] = useState(false);
   const hideTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const dockRef = useRef<HTMLDivElement>(null);
   const inactivityRef = useRef(0);
 
   useEffect(() => {
@@ -71,6 +79,7 @@ export function CallControls({
       hideTimeout.current = setTimeout(() => {
         setVisible(false);
         setShowMore(false);
+        setShowReactions(false);
       }, 4000);
     };
 
@@ -90,7 +99,6 @@ export function CallControls({
 
   return (
     <div
-      ref={dockRef}
       className={`fixed bottom-0 left-0 right-0 flex items-center justify-center pb-6 sm:pb-8 pointer-events-none z-40 transition-all duration-500 ${
         visible ? "translate-y-0 opacity-100" : "translate-y-8 opacity-0"
       }`}
@@ -162,7 +170,10 @@ export function CallControls({
         <div className="relative">
           <ControlButton
             active={false}
-            onClick={() => setShowMore(!showMore)}
+            onClick={() => {
+              setShowReactions(!showReactions);
+              setShowMore(false);
+            }}
             label="Reactions"
             icon={
               <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
@@ -173,12 +184,12 @@ export function CallControls({
               </svg>
             }
           />
-          {showMore && (
+          {showReactions && (
             <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-3 glass-strong rounded-2xl px-3 py-2.5 flex gap-2 shadow-glass-lg border-white/[0.06]">
               {REACTIONS.map((type) => (
                 <button
                   key={type}
-                  onClick={() => { onReaction(type); setShowMore(false); }}
+                  onClick={() => { onReaction(type); setShowReactions(false); }}
                   className="w-9 h-9 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] active:bg-white/[0.06] flex items-center justify-center transition-all duration-200 btn-premium"
                   aria-label={type}
                 >
@@ -191,6 +202,71 @@ export function CallControls({
                   </svg>
                 </button>
               ))}
+            </div>
+          )}
+        </div>
+
+        {/* More actions */}
+        <div className="relative">
+          <ControlButton
+            active={false}
+            onClick={() => {
+              setShowMore(!showMore);
+              setShowReactions(false);
+            }}
+            label="More actions"
+            icon={
+              <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
+                <circle cx="12" cy="5" r="1" />
+                <circle cx="12" cy="12" r="1" />
+                <circle cx="12" cy="19" r="1" />
+              </svg>
+            }
+          />
+          {showMore && (
+            <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-3 glass-strong rounded-2xl px-3 py-2.5 flex flex-col gap-1 shadow-glass-lg border-white/[0.06] whitespace-nowrap">
+              <button
+                onClick={() => { onNext(); setShowMore(false); }}
+                className="flex items-center gap-2.5 px-3 py-2 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] text-xs text-white/70 transition-all duration-200 btn-premium text-left"
+                aria-label="Next user"
+              >
+                <svg className="w-4 h-4 text-white/50" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
+                  <path d="M4 4v16l12-8-12-8z" />
+                  <path d="M20 5v14" />
+                </svg>
+                Next User
+              </button>
+              <button
+                onClick={() => { onFullscreen(); setShowMore(false); }}
+                className="flex items-center gap-2.5 px-3 py-2 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] text-xs text-white/70 transition-all duration-200 btn-premium text-left"
+                aria-label="Fullscreen"
+              >
+                <svg className="w-4 h-4 text-white/50" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
+                  <path d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3m0 18h3a2 2 0 002-2v-3M3 16v3a2 2 0 002 2h3" />
+                </svg>
+                Fullscreen
+              </button>
+              <button
+                onClick={() => { onReport(); setShowMore(false); }}
+                className="flex items-center gap-2.5 px-3 py-2 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] text-xs text-white/70 transition-all duration-200 btn-premium text-left"
+                aria-label="Report user"
+              >
+                <svg className="w-4 h-4 text-white/50" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
+                  <path d="M4 15s1 1 4 1 5-2 8-2 4 1 4 1V4s-1-1-4-1-5 2-8 2-4-1-4-1v10z" />
+                  <path d="M4 22v-7" />
+                </svg>
+                Report
+              </button>
+              <button
+                onClick={() => { onBlock(); setShowMore(false); }}
+                className="flex items-center gap-2.5 px-3 py-2 rounded-xl bg-white/[0.04] hover:bg-error/[0.15] text-xs text-error/70 transition-all duration-200 btn-premium text-left"
+                aria-label="Block user"
+              >
+                <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
+                  <path d="M10 12h4M12 4c-1.5 0-3 .7-3.9 1.9A5 5 0 002 12a5 5 0 001.9 3.9M12 4c1.5 0 3 .7 3.9 1.9A5 5 0 0122 12a5 5 0 01-1.9 3.9M6 17.7C7.5 19 9.7 20 12 20c4.4 0 8-3.6 8-8 0-1.8-.6-3.5-1.6-4.9" />
+                </svg>
+                Block
+              </button>
             </div>
           )}
         </div>

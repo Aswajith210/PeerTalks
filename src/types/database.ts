@@ -41,6 +41,21 @@ export interface Database {
         Insert: Omit<MatchingQueueEntry, "id" | "created_at">;
         Update: Partial<Omit<MatchingQueueEntry, "id">>;
       };
+      reports: {
+        Row: Report;
+        Insert: Omit<Report, "id" | "created_at">;
+        Update: never;
+      };
+      blocks: {
+        Row: Block;
+        Insert: Omit<Block, "id" | "created_at">;
+        Update: never;
+      };
+      message_reactions: {
+        Row: MessageReaction;
+        Insert: Omit<MessageReaction, "id" | "created_at">;
+        Update: never;
+      };
     };
   };
 }
@@ -77,6 +92,7 @@ export interface ChatSession {
   id: string;
   mode: "random" | "interest" | "private_room";
   status: "waiting" | "matching" | "connected" | "ended";
+  call_type: "video" | "text";
   user1_id: string | null;
   user2_id: string | null;
   room_id: string | null;
@@ -116,9 +132,34 @@ export interface MatchingQueueEntry {
   user_id: string;
   mode: "random" | "interest";
   interests: string[];
+  call_type: "video" | "text";
   status: "waiting" | "matched";
   matched_user_id: string | null;
   session_id: string | null;
   created_at: string;
   matched_at: string | null;
+}
+
+export interface Report {
+  id: number;
+  reporter_id: string;
+  reported_user_id: string;
+  session_id: string | null;
+  reason: string;
+  created_at: string;
+}
+
+export interface Block {
+  id: number;
+  blocker_id: string;
+  blocked_id: string;
+  created_at: string;
+}
+
+export interface MessageReaction {
+  id: number;
+  message_id: number;
+  user_id: string;
+  reaction: string;
+  created_at: string;
 }

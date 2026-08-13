@@ -150,7 +150,7 @@ export default function Home() {
                 <svg className="w-3.5 h-3.5 text-white/15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
                   <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" /><circle cx="9" cy="7" r="4" />
                 </svg>
-                No account needed
+                Anonymous by default
               </span>
               <span className="flex items-center gap-2">
                 <svg className="w-3.5 h-3.5 text-white/15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
@@ -477,7 +477,7 @@ export default function Home() {
               Ready for something real?
             </h2>
             <p className="text-muted text-sm mb-8 max-w-sm mx-auto leading-relaxed">
-              No sign-up required. Start a conversation and experience the difference.
+              Simple Google sign-in. No profiles, no followers — just real conversation.
             </p>
             <div className="max-w-xs mx-auto w-full">
               <LoginButton />

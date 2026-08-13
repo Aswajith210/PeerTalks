@@ -73,6 +73,45 @@ export function Navbar() {
             <span className="text-base font-semibold text-white/80 group-hover:text-white/90 transition-colors duration-300">PeerTalks</span>
           </Link>
 
+          <div className="hidden md:flex items-center gap-1">
+            <Link
+              href="/"
+              className={`px-3 py-2 rounded-xl text-sm font-medium transition-all duration-200 hover:bg-white/[0.04] ${
+                pathname === "/" ? "text-white/90" : "text-white/40 hover:text-white/70"
+              }`}
+            >
+              Home
+            </Link>
+            {user && (
+              <>
+                <Link
+                  href="/chat/random"
+                  className={`px-3 py-2 rounded-xl text-sm font-medium transition-all duration-200 hover:bg-white/[0.04] ${
+                    pathname.startsWith("/chat/random") ? "text-white/90" : "text-white/40 hover:text-white/70"
+                  }`}
+                >
+                  Chat
+                </Link>
+                <Link
+                  href="/chat/interest"
+                  className={`px-3 py-2 rounded-xl text-sm font-medium transition-all duration-200 hover:bg-white/[0.04] ${
+                    pathname.startsWith("/chat/interest") ? "text-white/90" : "text-white/40 hover:text-white/70"
+                  }`}
+                >
+                  Interests
+                </Link>
+                <Link
+                  href="/chat/room/new"
+                  className={`px-3 py-2 rounded-xl text-sm font-medium transition-all duration-200 hover:bg-white/[0.04] ${
+                    pathname.startsWith("/chat/room") ? "text-white/90" : "text-white/40 hover:text-white/70"
+                  }`}
+                >
+                  Rooms
+                </Link>
+              </>
+            )}
+          </div>
+
           <div className="flex items-center gap-2 sm:gap-3">
             {loading ? (
               <div className="w-22 h-9 rounded-xl bg-white/[0.03] animate-pulse" />

@@ -23,6 +23,7 @@ function InterestChatContent() {
   const [interests, setInterests] = useState<string[]>([]);
   const [customInterest, setCustomInterest] = useState("");
   const [status, setStatus] = useState<"select" | "matching" | "connected">("select");
+  const [callType, setCallType] = useState<"video" | "text">("video");
   const [error, setError] = useState<string | null>(null);
   const supabaseRef = useRef<SupabaseClient | null>(null);
   const subscriptionRef = useRef<RealtimeChannel | null>(null);
@@ -105,7 +106,7 @@ function InterestChatContent() {
 
       const res = await fetch("/api/matching/interest", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "x-call-type": callType },
         body: JSON.stringify({ interests }),
       });
       const data = await res.json();
@@ -125,7 +126,7 @@ function InterestChatContent() {
       setError("Something went wrong. Please try again.");
       setStatus("select");
     }
-  }, [interests, router, unsubscribeMatching]);
+  }, [interests, callType, router, unsubscribeMatching]);
 
   const cancelMatching = useCallback(async () => {
     unsubscribeMatching();
@@ -148,6 +149,29 @@ function InterestChatContent() {
               <div className="text-center mb-6">
                 <h1 className="text-xl font-semibold text-white/90 mb-2">Interest Chat</h1>
                 <p className="text-sm text-muted">Select your interests to find people who share your passions.</p>
+              </div>
+
+              <div className="flex rounded-lg bg-white/5 border border-white/10 p-0.5 mb-6">
+                <button
+                  onClick={() => setCallType("video")}
+                  className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-all ${
+                    callType === "video"
+                      ? "bg-white/10 text-white border border-white/10"
+                      : "text-white/40 hover:text-white/60"
+                  } focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20`}
+                >
+                  Video
+                </button>
+                <button
+                  onClick={() => setCallType("text")}
+                  className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-all ${
+                    callType === "text"
+                      ? "bg-white/10 text-white border border-white/10"
+                      : "text-white/40 hover:text-white/60"
+                  } focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20`}
+                >
+                  Text
+                </button>
               </div>
 
               <div className="mb-6">
@@ -211,7 +235,7 @@ function InterestChatContent() {
                 onClick={startMatching}
                 disabled={interests.length === 0}
               >
-                Find a match (2 tokens)
+                Find a {callType === "video" ? "video" : "text"} match (2 tokens)
               </Button>
             </div>
           </motion.div>
