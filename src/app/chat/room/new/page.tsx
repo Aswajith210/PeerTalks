@@ -7,10 +7,12 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
+import { useTokens } from "@/hooks/useTokens";
 import { motion } from "framer-motion";
 
 function PrivateRoomContent() {
   const router = useRouter();
+  const { refresh } = useTokens();
   const [tab, setTab] = useState<"create" | "join">("create");
   const [name, setName] = useState("");
   const [password, setPassword] = useState("");
@@ -41,6 +43,8 @@ function PrivateRoomContent() {
         setLoading(false);
         return;
       }
+
+      await refresh();
 
       router.push(`/chat/room/${data.session?.id || data.room?.id}`);
     } catch {
@@ -73,6 +77,8 @@ function PrivateRoomContent() {
         setLoading(false);
         return;
       }
+
+      await refresh();
 
       router.push(`/chat/room/${data.session?.id || data.room?.id}`);
     } catch {

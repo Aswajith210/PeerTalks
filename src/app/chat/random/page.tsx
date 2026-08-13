@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/Button";
 import { motion, AnimatePresence } from "framer-motion";
 import { createClient } from "@/lib/supabase/client";
 import type { SupabaseClient, RealtimeChannel } from "@supabase/supabase-js";
+import { useTokens } from "@/hooks/useTokens";
 
 function MatchingAnimation() {
   return (
@@ -35,6 +36,7 @@ function MatchingAnimation() {
 
 function RandomChatContent() {
   const router = useRouter();
+  const { refresh } = useTokens();
   const [status, setStatus] = useState<"select" | "matching" | "connected">("select");
   const [matchError, setMatchError] = useState<string | null>(null);
   const supabaseRef = useRef<SupabaseClient | null>(null);
@@ -112,6 +114,8 @@ function RandomChatContent() {
         return;
       }
 
+      await refresh();
+
       if (data.matched && data.sessionId) {
         setStatus("connected");
         setTimeout(() => router.push(`/chat/room/${data.sessionId}`), 800);
@@ -122,14 +126,15 @@ function RandomChatContent() {
       setStatus("select");
       matchingRef.current = false;
     }
-  }, [router, unsubscribeMatching]);
+  }, [router, unsubscribeMatching, refresh]);
 
   const cancelMatching = useCallback(async () => {
     matchingRef.current = false;
     unsubscribeMatching();
     await fetch("/api/matching/random", { method: "DELETE" }).catch(() => {});
+    await refresh();
     setStatus("select");
-  }, [unsubscribeMatching]);
+  }, [unsubscribeMatching, refresh]);
 
   useEffect(() => {
     return () => {

@@ -57,7 +57,7 @@ function QuickActionCard({
 function DashboardContent() {
   const router = useRouter();
   const { user } = useAuth();
-  const { balance, loading: tokensLoading } = useTokens();
+  const { balance, loading: tokensLoading, refresh } = useTokens();
   const toast = useToast();
 
   const hasClaimed = useRef(false);
@@ -75,6 +75,7 @@ function DashboardContent() {
         });
         const data = await res.json();
         if (data.claimed) {
+          await refresh();
           toast.success("Daily tokens claimed!", `${data.balance} tokens available`);
         }
       } catch {}

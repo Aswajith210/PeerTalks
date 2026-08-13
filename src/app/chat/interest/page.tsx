@@ -10,6 +10,7 @@ import { Input } from "@/components/ui/Input";
 import { motion, AnimatePresence } from "framer-motion";
 import { createClient } from "@/lib/supabase/client";
 import type { SupabaseClient, RealtimeChannel } from "@supabase/supabase-js";
+import { useTokens } from "@/hooks/useTokens";
 
 const SUGGESTED_INTERESTS = [
   "Music", "Gaming", "Art", "Technology",
@@ -20,6 +21,7 @@ const SUGGESTED_INTERESTS = [
 
 function InterestChatContent() {
   const router = useRouter();
+  const { refresh } = useTokens();
   const [interests, setInterests] = useState<string[]>([]);
   const [customInterest, setCustomInterest] = useState("");
   const [status, setStatus] = useState<"select" | "matching" | "connected">("select");
@@ -128,6 +130,8 @@ function InterestChatContent() {
         return;
       }
 
+      await refresh();
+
       if (data.matched && data.sessionId) {
         setStatus("connected");
         setTimeout(() => router.push(`/chat/room/${data.sessionId}`), 800);
@@ -138,14 +142,15 @@ function InterestChatContent() {
       setStatus("select");
       matchingRef.current = false;
     }
-  }, [interests, callType, router, unsubscribeMatching]);
+  }, [interests, callType, router, unsubscribeMatching, refresh]);
 
   const cancelMatching = useCallback(async () => {
     matchingRef.current = false;
     unsubscribeMatching();
     await fetch("/api/matching/interest", { method: "DELETE" }).catch(() => {});
+    await refresh();
     setStatus("select");
-  }, [unsubscribeMatching]);
+  }, [unsubscribeMatching, refresh]);
 
   return (
     <div className="min-h-screen flex items-center justify-center px-4 pt-16">
