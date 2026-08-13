@@ -21,7 +21,7 @@ const SUGGESTED_INTERESTS = [
 
 function InterestChatContent() {
   const router = useRouter();
-  const { refresh } = useTokens();
+  const { refresh, setBalance } = useTokens();
   const [interests, setInterests] = useState<string[]>([]);
   const [customInterest, setCustomInterest] = useState("");
   const [status, setStatus] = useState<"select" | "matching" | "connected">("select");
@@ -133,6 +133,7 @@ function InterestChatContent() {
         return;
       }
 
+      if (typeof data.balance === "number") setBalance(data.balance);
       await refresh();
 
       if (data.matched && data.sessionId) {
@@ -145,15 +146,19 @@ function InterestChatContent() {
       setStatus("select");
       matchingRef.current = false;
     }
-  }, [interests, callType, router, unsubscribeMatching, refresh]);
+  }, [interests, callType, router, unsubscribeMatching, refresh, setBalance]);
 
   const cancelMatching = useCallback(async () => {
     matchingRef.current = false;
     unsubscribeMatching();
-    await fetch("/api/matching/interest", { method: "DELETE" }).catch(() => {});
+    const res = await fetch("/api/matching/interest", { method: "DELETE" }).catch(() => null);
+    if (res) {
+      const body = (await res.json().catch(() => null)) as { balance?: number } | null;
+      if (body && typeof body.balance === "number") setBalance(body.balance);
+    }
     await refresh();
     setStatus("select");
-  }, [unsubscribeMatching, refresh]);
+  }, [unsubscribeMatching, refresh, setBalance]);
 
   return (
     <div className="min-h-screen flex items-center justify-center px-4 pt-16">

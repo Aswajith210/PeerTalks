@@ -12,7 +12,7 @@ import { motion } from "framer-motion";
 
 function PrivateRoomContent() {
   const router = useRouter();
-  const { refresh } = useTokens();
+  const { refresh, setBalance } = useTokens();
   const [tab, setTab] = useState<"create" | "join">("create");
   const [name, setName] = useState("");
   const [password, setPassword] = useState("");
@@ -47,6 +47,7 @@ function PrivateRoomContent() {
         return;
       }
 
+      if (typeof data.balance === "number") setBalance(data.balance);
       await refresh();
 
       router.push(`/chat/room/${data.session?.id || data.room?.id}`);
@@ -84,6 +85,7 @@ function PrivateRoomContent() {
         return;
       }
 
+      if (typeof data.balance === "number") setBalance(data.balance);
       await refresh();
 
       router.push(`/chat/room/${data.session?.id || data.room?.id}`);

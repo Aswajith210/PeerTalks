@@ -78,6 +78,7 @@ export async function POST(request: Request) {
     return NextResponse.json({
       room,
       session: { id: joinResult.session_id },
+      balance: deduction.balance,
     });
   }
 
@@ -153,5 +154,6 @@ export async function POST(request: Request) {
   return NextResponse.json({
     room,
     session: { id: sessionId },
+    balance: deduction.balance,
   });
 }

@@ -110,6 +110,7 @@ export async function POST(request: Request) {
       matched: true,
       sessionId: matchResult.session_id as string,
       peer: { id: matchResult.peer_id as string },
+      balance: deduction.balance,
     });
   }
 
@@ -123,10 +124,11 @@ export async function POST(request: Request) {
       matched: false,
       queueId: queueEntry.id,
       message: "Waiting for a match...",
+      balance: deduction.balance,
     });
   }
 
-  return NextResponse.json({ matched: false, message: "Waiting for a match..." });
+  return NextResponse.json({ matched: false, message: "Waiting for a match...", balance: deduction.balance });
 }
 
 export async function DELETE() {
@@ -149,7 +151,7 @@ export async function DELETE() {
 
   if (deleted && deleted.length > 0) {
     const refund = await refundTokens(session.user.id, TOKEN_COSTS.VIDEO_CHAT);
-    return NextResponse.json({ success: refund.success, refunded: true });
+    return NextResponse.json({ success: refund.success, refunded: true, balance: refund.balance });
   }
   return NextResponse.json({ success: true, refunded: false });
 }

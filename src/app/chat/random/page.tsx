@@ -36,7 +36,7 @@ function MatchingAnimation() {
 
 function RandomChatContent() {
   const router = useRouter();
-  const { refresh } = useTokens();
+  const { refresh, setBalance } = useTokens();
   const [status, setStatus] = useState<"select" | "matching" | "connected">("select");
   const [matchError, setMatchError] = useState<string | null>(null);
   const supabaseRef = useRef<SupabaseClient | null>(null);
@@ -117,6 +117,7 @@ function RandomChatContent() {
         return;
       }
 
+      if (typeof data.balance === "number") setBalance(data.balance);
       await refresh();
 
       if (data.matched && data.sessionId) {
@@ -129,15 +130,19 @@ function RandomChatContent() {
       setStatus("select");
       matchingRef.current = false;
     }
-  }, [router, unsubscribeMatching, refresh]);
+  }, [router, unsubscribeMatching, refresh, setBalance]);
 
   const cancelMatching = useCallback(async () => {
     matchingRef.current = false;
     unsubscribeMatching();
-    await fetch("/api/matching/random", { method: "DELETE" }).catch(() => {});
+    const res = await fetch("/api/matching/random", { method: "DELETE" }).catch(() => null);
+    if (res) {
+      const body = (await res.json().catch(() => null)) as { balance?: number } | null;
+      if (body && typeof body.balance === "number") setBalance(body.balance);
+    }
     await refresh();
     setStatus("select");
-  }, [unsubscribeMatching, refresh]);
+  }, [unsubscribeMatching, refresh, setBalance]);
 
   useEffect(() => {
     return () => {

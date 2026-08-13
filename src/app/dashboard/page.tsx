@@ -6,6 +6,7 @@ import { AuthGuard } from "@/components/auth/AuthGuard";
 import { TokenBalance } from "@/components/tokens/TokenBalance";
 import { useAuth } from "@/hooks/useAuth";
 import { useTokens } from "@/hooks/useTokens";
+import { TOKEN_COSTS } from "@/lib/constants";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef } from "react";
 import { useToast } from "@/hooks/useToast";
@@ -57,7 +58,7 @@ function QuickActionCard({
 function DashboardContent() {
   const router = useRouter();
   const { user } = useAuth();
-  const { balance, loading: tokensLoading, refresh } = useTokens();
+  const { loading: tokensLoading, refresh, setBalance } = useTokens();
   const toast = useToast();
 
   const hasClaimed = useRef(false);
@@ -74,8 +75,9 @@ function DashboardContent() {
           body: JSON.stringify({ tz }),
         });
         const data = await res.json();
+        if (typeof data.balance === "number") setBalance(data.balance);
+        await refresh();
         if (data.claimed) {
-          await refresh();
           toast.success("Daily tokens claimed!", `${data.balance} tokens available`);
         }
       } catch {}
@@ -83,6 +85,17 @@ function DashboardContent() {
     ensureTokens();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
+
+  // Revalidate the live balance before deciding "not enough tokens".
+  const checkAndNavigate = async (cost: number, path: string) => {
+    const fresh = await refresh();
+    if (fresh !== null && fresh < cost) {
+      console.warn("[tokens] dashboard check", { balance: fresh, cost });
+      toast.error("Not enough tokens", "Claim your daily tokens or wait for refill");
+      return;
+    }
+    router.push(path);
+  };
 
   const hours = new Date().getHours();
   const greeting = hours < 12 ? "Good morning" : hours < 17 ? "Good afternoon" : "Good evening";
@@ -113,13 +126,7 @@ function DashboardContent() {
             </svg>
           }
           cost={2}
-          onClick={() => {
-            if (balance < 2) {
-              console.warn("[tokens] dashboard check", { balance, cost: 2 });
-              toast.error("Not enough tokens", "Claim your daily tokens or wait for refill");
-            }
-            router.push("/chat/random");
-          }}
+          onClick={() => checkAndNavigate(TOKEN_COSTS.VIDEO_CHAT, "/chat/random")}
           disabled={tokensLoading}
         />
         <QuickActionCard
@@ -132,13 +139,7 @@ function DashboardContent() {
             </svg>
           }
           cost={2}
-          onClick={() => {
-            if (balance < 2) {
-              console.warn("[tokens] dashboard check", { balance, cost: 2 });
-              toast.error("Not enough tokens", "Claim your daily tokens or wait for refill");
-            }
-            router.push("/chat/interest");
-          }}
+          onClick={() => checkAndNavigate(TOKEN_COSTS.VIDEO_CHAT, "/chat/interest")}
           disabled={tokensLoading}
         />
         <QuickActionCard
@@ -152,13 +153,7 @@ function DashboardContent() {
             </svg>
           }
           cost={5}
-          onClick={() => {
-            if (balance < 5) {
-              console.warn("[tokens] dashboard check", { balance, cost: 5 });
-              toast.error("Not enough tokens", "Private rooms cost 5 tokens");
-            }
-            router.push("/chat/room/new");
-          }}
+          onClick={() => checkAndNavigate(TOKEN_COSTS.PRIVATE_ROOM, "/chat/room/new")}
           disabled={tokensLoading}
         />
       </div>

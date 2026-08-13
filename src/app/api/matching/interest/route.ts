@@ -123,6 +123,7 @@ export async function POST(request: Request) {
       matched: true,
       sessionId: matchResult.session_id as string,
       matchedInterest: (matchResult.matched_interest as string) ?? "",
+      balance: deduction.balance,
     });
   }
 
@@ -135,6 +136,7 @@ export async function POST(request: Request) {
     matched: false,
     queueId: queueEntry?.id,
     message: "Looking for someone who shares your interests...",
+    balance: deduction.balance,
   });
 }
 
@@ -155,7 +157,7 @@ export async function DELETE() {
 
   if (deleted && deleted.length > 0) {
     const refund = await refundTokens(session.user.id, TOKEN_COSTS.VIDEO_CHAT);
-    return NextResponse.json({ success: refund.success, refunded: true });
+    return NextResponse.json({ success: refund.success, refunded: true, balance: refund.balance });
   }
   return NextResponse.json({ success: true, refunded: false });
 }
