@@ -10,6 +10,11 @@ interface TokenState {
   error: string | null;
 }
 
+// The browser client is a module singleton, so multiple useTokens instances
+// (navbar, dashboard, settings) must NOT reuse the same channel topic —
+// duplicate subscriptions on one topic corrupt the realtime state machine.
+let channelCounter = 0;
+
 export function useTokens() {
   const [state, setState] = useState<TokenState>({
     balance: 0,
@@ -54,7 +59,7 @@ export function useTokens() {
       }
 
       const channel = supabase
-        .channel("token_balance_sync")
+        .channel(`token_balance_sync_${channelCounter++}`)
         .on(
           "postgres_changes",
           {

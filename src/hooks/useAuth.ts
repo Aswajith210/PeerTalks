@@ -1,11 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { User } from "@supabase/supabase-js";
+import type { Subscription } from "@supabase/supabase-js";
 
 export function useAuth() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  const subscriptionRef = useRef<Subscription | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -27,14 +29,15 @@ export function useAuth() {
       const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
         if (mounted) setUser(session?.user ?? null);
       });
-
-      return () => subscription.unsubscribe();
+      subscriptionRef.current = subscription;
     };
 
     init();
 
     return () => {
       mounted = false;
+      subscriptionRef.current?.unsubscribe();
+      subscriptionRef.current = null;
     };
   }, []);
 

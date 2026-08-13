@@ -27,6 +27,7 @@ function InterestChatContent() {
   const [error, setError] = useState<string | null>(null);
   const supabaseRef = useRef<SupabaseClient | null>(null);
   const subscriptionRef = useRef<RealtimeChannel | null>(null);
+  const matchingRef = useRef(false);
 
   useEffect(() => {
     createClient().then((client) => {
@@ -69,6 +70,8 @@ function InterestChatContent() {
       setError("Please select at least one interest");
       return;
     }
+    if (matchingRef.current) return;
+    matchingRef.current = true;
 
     setStatus("matching");
     setError(null);
@@ -76,7 +79,10 @@ function InterestChatContent() {
 
     try {
       const supabase = supabaseRef.current;
-      if (!supabase) return;
+      if (!supabase) {
+        matchingRef.current = false;
+        return;
+      }
 
       const { data: { session } } = await supabase.auth.getSession();
       const userId = session?.user.id;
@@ -114,6 +120,7 @@ function InterestChatContent() {
       if (!res.ok) {
         setError(data.error || "Failed to start matching");
         setStatus("select");
+        matchingRef.current = false;
         return;
       }
 
@@ -125,10 +132,12 @@ function InterestChatContent() {
     } catch {
       setError("Something went wrong. Please try again.");
       setStatus("select");
+      matchingRef.current = false;
     }
   }, [interests, callType, router, unsubscribeMatching]);
 
   const cancelMatching = useCallback(async () => {
+    matchingRef.current = false;
     unsubscribeMatching();
     await fetch("/api/matching/interest", { method: "DELETE" }).catch(() => {});
     setStatus("select");

@@ -36,7 +36,7 @@ function QuickActionCard({
       transition={{ duration: 0.5, delay: index * 0.08, ease: [0.16, 1, 0.3, 1] }}
       onClick={onClick}
       disabled={disabled}
-      className={`group text-left glass-card rounded-3xl p-6 sm:p-8 transition-all duration-300 ${
+      className={`group text-left glass-card rounded-3xl p-6 sm:p-8 transition-all duration-300 cursor-pointer hover:border-white/[0.12] hover:bg-white/[0.03] active:scale-[0.99] ${
         disabled ? "opacity-30 pointer-events-none" : ""
       } focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/15`}
     >
@@ -110,11 +110,10 @@ function DashboardContent() {
           onClick={() => {
             if (balance < 2) {
               toast.error("Not enough tokens", "Claim your daily tokens or wait for refill");
-              return;
             }
             router.push("/chat/random");
           }}
-          disabled={tokensLoading || balance < 2}
+          disabled={tokensLoading}
         />
         <QuickActionCard
           index={1}
@@ -129,11 +128,10 @@ function DashboardContent() {
           onClick={() => {
             if (balance < 2) {
               toast.error("Not enough tokens", "Claim your daily tokens or wait for refill");
-              return;
             }
             router.push("/chat/interest");
           }}
-          disabled={tokensLoading || balance < 2}
+          disabled={tokensLoading}
         />
         <QuickActionCard
           index={2}
@@ -149,11 +147,10 @@ function DashboardContent() {
           onClick={() => {
             if (balance < 5) {
               toast.error("Not enough tokens", "Private rooms cost 5 tokens");
-              return;
             }
             router.push("/chat/room/new");
           }}
-          disabled={tokensLoading || balance < 5}
+          disabled={tokensLoading}
         />
       </div>
 

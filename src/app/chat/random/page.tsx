@@ -39,6 +39,7 @@ function RandomChatContent() {
   const [matchError, setMatchError] = useState<string | null>(null);
   const supabaseRef = useRef<SupabaseClient | null>(null);
   const subscriptionRef = useRef<RealtimeChannel | null>(null);
+  const matchingRef = useRef(false);
 
   useEffect(() => {
     createClient().then((client) => {
@@ -54,6 +55,8 @@ function RandomChatContent() {
   }, []);
 
   const startMatching = useCallback(async (callType: "video" | "text" = "video") => {
+    if (matchingRef.current) return;
+    matchingRef.current = true;
     setStatus("matching");
     setMatchError(null);
     unsubscribeMatching();
@@ -63,6 +66,7 @@ function RandomChatContent() {
       if (!supabase) {
         setMatchError("Failed to initialize connection");
         setStatus("select");
+        matchingRef.current = false;
         return;
       }
 
@@ -101,6 +105,7 @@ function RandomChatContent() {
       if (!res.ok) {
         setMatchError(data.error || "Failed to start matching");
         setStatus("select");
+        matchingRef.current = false;
         return;
       }
 
@@ -112,10 +117,12 @@ function RandomChatContent() {
     } catch {
       setMatchError("Something went wrong. Please try again.");
       setStatus("select");
+      matchingRef.current = false;
     }
   }, [router, unsubscribeMatching]);
 
   const cancelMatching = useCallback(async () => {
+    matchingRef.current = false;
     unsubscribeMatching();
     await fetch("/api/matching/random", { method: "DELETE" }).catch(() => {});
     setStatus("select");

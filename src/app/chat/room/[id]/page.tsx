@@ -40,6 +40,7 @@ function ChatRoomContent() {
   const [reportSubmitting, setReportSubmitting] = useState(false);
   const [showBlockConfirm, setShowBlockConfirm] = useState(false);
   const [myUserId, setMyUserId] = useState<string | null>(null);
+  const [clientReady, setClientReady] = useState(false);
   const [reactions, setReactions] = useState<Record<number, Record<string, { count: number; mine: boolean }>>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
@@ -65,6 +66,7 @@ function ChatRoomContent() {
         userIdRef.current = session?.user?.id ?? null;
         setMyUserId(session?.user?.id ?? null);
       }
+      setClientReady(true);
     });
   }, []);
 
@@ -85,6 +87,10 @@ function ChatRoomContent() {
     const setupTextChannel = async () => {
       const supabase = getSupabase();
       if (!supabase || cancelled) return;
+      if (signalingChannelRef.current) {
+        supabase.removeChannel(signalingChannelRef.current);
+        signalingChannelRef.current = null;
+      }
       const channel = supabase.channel(`textsync:${id}`);
       channel
         .on("broadcast", { event: "typing" }, (payload) => {
@@ -105,29 +111,39 @@ function ChatRoomContent() {
 
     const loadSession = async () => {
       const supabase = supabaseRef.current;
-      if (!supabase) return;
+      if (!supabase) {
+        if (clientReady && !cancelled) {
+          setMediaError("Unable to connect. Please check your network and reload.");
+          setCallLoaded(true);
+        }
+        return;
+      }
       const { data } = await supabase
         .from("chat_sessions")
         .select("call_type, user1_id, user2_id, status")
         .eq("id", id)
-        .single();
-      if (!cancelled && data) {
-        setCallType(data.call_type ?? "video");
-        const myId = userIdRef.current;
-        if (myId) {
-          peerIdRef.current = data.user1_id === myId ? data.user2_id : data.user1_id;
+        .maybeSingle();
+      if (!cancelled) {
+        if (data) {
+          setCallType(data.call_type ?? "video");
+          const myId = userIdRef.current;
+          if (myId) {
+            peerIdRef.current = data.user1_id === myId ? data.user2_id : data.user1_id;
+          }
+          if (data.call_type === "text") {
+            setJoined(true);
+            setupTextChannel();
+          }
+        } else {
+          toast.error("Conversation not found");
+          router.replace("/dashboard");
         }
-        // Text chats join automatically
-        if (data.call_type === "text") {
-          setJoined(true);
-          setupTextChannel();
-        }
+        setCallLoaded(true);
       }
-      if (!cancelled) setCallLoaded(true);
     };
     loadSession();
     return () => { cancelled = true; };
-  }, [id]);
+  }, [id, clientReady, router, toast]);
 
   // Message history + realtime
   useEffect(() => {

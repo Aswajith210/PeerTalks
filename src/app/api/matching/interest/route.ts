@@ -67,7 +67,8 @@ export async function POST(request: Request) {
       .select("*")
       .eq("mode", "interest").eq("call_type", callType).eq("status", "waiting")
       .neq("user_id", userId)
-      .order("created_at", { ascending: true });
+      .order("created_at", { ascending: true })
+      .limit(20);
 
     if (existing) {
       for (const entry of existing) {
