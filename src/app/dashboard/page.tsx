@@ -115,6 +115,7 @@ function DashboardContent() {
           cost={2}
           onClick={() => {
             if (balance < 2) {
+              console.warn("[tokens] dashboard check", { balance, cost: 2 });
               toast.error("Not enough tokens", "Claim your daily tokens or wait for refill");
             }
             router.push("/chat/random");
@@ -133,6 +134,7 @@ function DashboardContent() {
           cost={2}
           onClick={() => {
             if (balance < 2) {
+              console.warn("[tokens] dashboard check", { balance, cost: 2 });
               toast.error("Not enough tokens", "Claim your daily tokens or wait for refill");
             }
             router.push("/chat/interest");
@@ -152,6 +154,7 @@ function DashboardContent() {
           cost={5}
           onClick={() => {
             if (balance < 5) {
+              console.warn("[tokens] dashboard check", { balance, cost: 5 });
               toast.error("Not enough tokens", "Private rooms cost 5 tokens");
             }
             router.push("/chat/room/new");

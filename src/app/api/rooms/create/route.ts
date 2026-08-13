@@ -42,8 +42,11 @@ export async function POST(request: Request) {
     requestKey
   );
   if (!deduction.success) {
+    console.error("[tokens] room create blocked", {
+      userId: session.user.id, cost: 5, balance: deduction.balance, reason: deduction.reason,
+    });
     return NextResponse.json(
-      { error: "Insufficient tokens", balance: deduction.balance },
+      { error: "Insufficient tokens", balance: deduction.balance, reason: deduction.reason },
       { status: 400 }
     );
   }

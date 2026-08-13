@@ -39,6 +39,9 @@ function PrivateRoomContent() {
       const data = await res.json();
 
       if (!res.ok) {
+        console.error("[tokens] room create POST rejected", {
+          status: res.status, body: data,
+        });
         setError(data.error || "Failed to create room");
         setLoading(false);
         return;
@@ -73,6 +76,9 @@ function PrivateRoomContent() {
       const data = await res.json();
 
       if (!res.ok) {
+        console.error("[tokens] room join POST rejected", {
+          status: res.status, body: data,
+        });
         setError(data.error || "Failed to join room");
         setLoading(false);
         return;

@@ -49,6 +49,7 @@ export function TokensProvider({ children }: { children: React.ReactNode }) {
     const userId = userIdRef.current;
     if (!supabase || !userId) return;
     const id = ++refreshIdRef.current;
+    console.log("[tokens] fetching balance", { userId });
     const { data, error } = await supabase
       .from("token_balances")
       .select("balance")
@@ -56,8 +57,10 @@ export function TokensProvider({ children }: { children: React.ReactNode }) {
       .maybeSingle();
     if (id !== refreshIdRef.current) return;
     if (error) {
+      console.error("[tokens] balance fetch error", { userId, message: error.message });
       setState((s) => ({ ...s, loading: false, error: error.message }));
     } else {
+      console.log("[tokens] balance fetched", { userId, balance: data?.balance ?? 0 });
       applyBalance(data?.balance ?? 0);
     }
   }, [applyBalance]);
@@ -128,11 +131,15 @@ export function TokensProvider({ children }: { children: React.ReactNode }) {
       };
 
       const { data: { session } } = await supabase.auth.getSession();
+      console.log("[tokens] provider session resolved", { userId: session?.user.id ?? null });
       await setupForUser(session?.user.id ?? null);
 
       const { data: { subscription } } = supabase.auth.onAuthStateChange(
-        (_event, session) => {
+        (event, session) => {
           const nextUserId = session?.user.id ?? null;
+          console.log("[tokens] auth change", {
+            event, nextUserId, previousUserId: userIdRef.current,
+          });
           if (nextUserId !== userIdRef.current) {
             void setupForUser(nextUserId);
           }

@@ -50,7 +50,10 @@ export async function POST(request: Request) {
 
   const deduction = await deduct(userId, requestKey);
   if (!deduction.success) {
-    return NextResponse.json({ error: "Insufficient tokens", balance: deduction.balance }, { status: 400 });
+    console.error("[tokens] random chat blocked", {
+      userId, cost: TOKEN_COSTS.VIDEO_CHAT, balance: deduction.balance, reason: deduction.reason,
+    });
+    return NextResponse.json({ error: "Insufficient tokens", balance: deduction.balance, reason: deduction.reason }, { status: 400 });
   }
 
   let matchResult: Record<string, unknown> | null = null;

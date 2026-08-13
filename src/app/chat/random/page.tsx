@@ -108,6 +108,9 @@ function RandomChatContent() {
       const data = await res.json();
 
       if (!res.ok) {
+        console.error("[tokens] random chat POST rejected", {
+          userId, cost: 2, status: res.status, body: data,
+        });
         setMatchError(data.error || "Failed to start matching");
         setStatus("select");
         matchingRef.current = false;

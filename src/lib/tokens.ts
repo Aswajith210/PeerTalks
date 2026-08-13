@@ -83,7 +83,12 @@ export async function ensureDailyTokens(
     p_timezone: tz,
   });
 
-  if (!error && data) {
+  if (error) {
+    console.warn("[tokens] claim RPC unavailable, using fallback", {
+      userId, code: error.code, message: error.message,
+    });
+  } else if (data) {
+    console.log("[tokens] claim RPC result", { userId, result: data });
     const r = data as { success?: boolean; claimed?: boolean; balance?: number };
     if (r.success) {
       return { claimed: r.claimed === true, balance: r.balance ?? 0 };
@@ -125,17 +130,35 @@ export async function ensureDailyTokens(
     }
 
     const newBalance = balance.balance + TOKEN_ALLOWANCE.AMOUNT;
-    const { data: updated } = await supabase
-      .from("token_balances")
-      .update({
+
+    // Older deployed schemas may lack `updated_at`; retry without that column.
+    const applyUpdate = async (withUpdatedAt: boolean) => {
+      const patch: Record<string, unknown> = {
         balance: newBalance,
         last_daily_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq("user_id", userId)
-      .eq("last_daily_at", balance.last_daily_at)
-      .select("balance")
-      .maybeSingle();
+      };
+      if (withUpdatedAt) patch.updated_at = new Date().toISOString();
+      return supabase
+        .from("token_balances")
+        .update(patch)
+        .eq("user_id", userId)
+        .eq("last_daily_at", balance.last_daily_at)
+        .select("balance")
+        .maybeSingle();
+    };
+
+    let { data: updated, error: updateError } = await applyUpdate(true);
+    if (!updated && updateError) {
+      console.warn("[tokens] claim fallback update failed, retrying without updated_at", {
+        userId, error: updateError.message,
+      });
+      ({ data: updated, error: updateError } = await applyUpdate(false));
+      if (!updated && updateError) {
+        console.warn("[tokens] claim fallback update failed (no updated_at retry)", {
+          userId, error: updateError.message,
+        });
+      }
+    }
 
     if (updated) {
       await supabase.from("token_transactions").insert({
@@ -182,7 +205,12 @@ export async function deductTokens(
     p_idempotency_key: idempotencyKey ?? null,
   });
 
-  if (!error && data) {
+  if (error) {
+    console.warn("[tokens] deduct RPC unavailable, using fallback", {
+      userId, amount, code: error.code, message: error.message,
+    });
+  } else if (data) {
+    console.log("[tokens] deduct RPC result", { userId, amount, result: data });
     const r = data as { success?: boolean; balance?: number; reason?: string; idempotent?: boolean };
     return {
       success: r.success === true,
@@ -222,17 +250,38 @@ export async function deductTokens(
 
     const current = balance?.balance ?? 0;
     if (amount > 0 && current < amount) {
+      console.warn("[tokens] insufficient balance", { userId, amount, current });
       return { success: false, balance: current, reason: "insufficient" };
     }
 
     const newBalance = current + amount;
-    const { data: updated } = await supabase
-      .from("token_balances")
-      .update({ balance: newBalance, updated_at: new Date().toISOString() })
-      .eq("user_id", userId)
-      .eq("balance", current)
-      .select("balance")
-      .maybeSingle();
+
+    // Older deployed schemas may lack `updated_at`; retry the same attempt
+    // without that column so the check never fails on schema drift.
+    const applyUpdate = async (withUpdatedAt: boolean) => {
+      const patch: Record<string, unknown> = { balance: newBalance };
+      if (withUpdatedAt) patch.updated_at = new Date().toISOString();
+      return supabase
+        .from("token_balances")
+        .update(patch)
+        .eq("user_id", userId)
+        .eq("balance", current)
+        .select("balance")
+        .maybeSingle();
+    };
+
+    let { data: updated, error: updateError } = await applyUpdate(true);
+    if (!updated && updateError) {
+      console.warn("[tokens] fallback update failed, retrying without updated_at", {
+        userId, amount, error: updateError.message,
+      });
+      ({ data: updated, error: updateError } = await applyUpdate(false));
+      if (!updated && updateError) {
+        console.warn("[tokens] fallback update failed (no updated_at retry)", {
+          userId, amount, error: updateError.message,
+        });
+      }
+    }
 
     if (updated) {
       const { error: txError } = await supabase.from("token_transactions").insert({
@@ -247,6 +296,9 @@ export async function deductTokens(
         // A concurrent request committed this key first — same outcome.
         return { success: true, balance: newBalance, idempotent: true };
       }
+      if (txError) {
+        console.warn("[tokens] fallback tx insert warning", { userId, amount, error: txError.message });
+      }
       return { success: true, balance: newBalance };
     }
   }
@@ -256,6 +308,9 @@ export async function deductTokens(
     .select("balance")
     .eq("user_id", userId)
     .maybeSingle();
+  console.error("[tokens] fallback exhausted, deduct failed", {
+    userId, amount, finalBalance: finalBalance?.balance ?? 0,
+  });
   return { success: false, balance: finalBalance?.balance ?? 0 };
 }
 

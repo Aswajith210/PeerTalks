@@ -124,6 +124,9 @@ function InterestChatContent() {
       const data = await res.json();
 
       if (!res.ok) {
+        console.error("[tokens] interest chat POST rejected", {
+          userId, cost: 2, status: res.status, body: data,
+        });
         setError(data.error || "Failed to start matching");
         setStatus("select");
         matchingRef.current = false;
