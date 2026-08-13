@@ -14,6 +14,16 @@ export async function createServerSupabaseClient() {
     return null;
   }
 
+  if (supabaseKey.startsWith("NEXT_PUBLIC_SUPABASE_ANON_KEY=")) {
+    console.error(
+      "[Supabase] NEXT_PUBLIC_SUPABASE_ANON_KEY contains the whole `KEY=value` line. " +
+        "In Vercel, paste ONLY the key itself (e.g. `eyJ...`) into the Value field — no " +
+        "variable name, no `=` sign. The prefixed value makes the app send an invalid " +
+        "apikey header, which Supabase rejects with 'Invalid API key'."
+    );
+    return null;
+  }
+
   const cookieStore = await cookies();
 
   return createServerClient(supabaseUrl, supabaseKey, {

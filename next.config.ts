@@ -30,6 +30,14 @@ function anonKeyProjectRef(anonKey: string | undefined): string | null {
   }
 }
 
+function isLegacyAnonKey(value: string): boolean {
+  return /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
+}
+
+function isPublishableKey(value: string): boolean {
+  return /^sb_publishable_[A-Za-z0-9_-]+$/.test(value);
+}
+
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
@@ -40,6 +48,26 @@ if (!supabaseUrl || !anonKey) {
       "Variables → Production) before building. The current key/URL pair is " +
       "inlined at build time — a build without them produces 'Invalid API key' " +
       "in production."
+  );
+}
+
+if (anonKey.startsWith("NEXT_PUBLIC_SUPABASE_ANON_KEY=") || anonKey.startsWith("NEXT_PUBLIC_SUPABASE_URL=")) {
+  throw new Error(
+    "NEXT_PUBLIC_SUPABASE_ANON_KEY is malformed: its value contains the whole " +
+      "`KEY=value` line (it starts with \"NEXT_PUBLIC_SUPABASE_ANON_KEY=\"). " +
+      "In Vercel, paste ONLY the key itself (e.g. `eyJ...`) into the Value field — " +
+      "do not include the variable name or an `=` sign. A prefixed value makes the " +
+      "app send an invalid apikey header, which Supabase rejects with " +
+      "\"Invalid API key\"."
+  );
+}
+
+if (!isLegacyAnonKey(anonKey) && !isPublishableKey(anonKey)) {
+  throw new Error(
+    "NEXT_PUBLIC_SUPABASE_ANON_KEY does not look like a Supabase key. Expected a " +
+      "JWT (starts with `eyJ`) or a publishable key (starts with `sb_publishable_`). " +
+      "Copy it from Supabase → Settings → API → API Keys for the project matching " +
+      "NEXT_PUBLIC_SUPABASE_URL."
   );
 }
 

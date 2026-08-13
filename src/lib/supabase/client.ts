@@ -52,6 +52,19 @@ async function init() {
     return;
   }
 
+  if (supabaseKey.startsWith("NEXT_PUBLIC_SUPABASE_ANON_KEY=")) {
+    if (!_diagnosed) {
+      _diagnosed = true;
+      console.error(
+        "[Supabase] NEXT_PUBLIC_SUPABASE_ANON_KEY contains the whole `KEY=value` line. " +
+          "In Vercel, paste ONLY the key itself (e.g. `eyJ...`) into the Value field — no " +
+          "variable name, no `=` sign. The prefixed value makes the app send an invalid " +
+          "apikey header, which Supabase rejects with 'Invalid API key'."
+      );
+    }
+    return;
+  }
+
   const urlRef = projectRefFromUrl(supabaseUrl);
   const keyRef = projectRefFromKey(supabaseKey);
   if (urlRef && keyRef && urlRef !== keyRef) {
