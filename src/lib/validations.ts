@@ -46,4 +46,8 @@ export const schemas = {
   endSession: {
     sessionId: { type: "string", required: true },
   },
+  updateProfile: {
+    displayName: { type: "string", required: true, min: 1, max: 40 },
+    bio: { type: "string", max: 160 },
+  },
 };

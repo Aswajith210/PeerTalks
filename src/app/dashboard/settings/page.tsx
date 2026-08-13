@@ -21,16 +21,11 @@ function SettingsContent() {
   useEffect(() => {
     const load = async () => {
       if (!user) return;
-      const supabase = await createClient();
-      if (!supabase) return;
-      const { data } = await supabase
-        .from("profiles")
-        .select("display_name, bio")
-        .eq("id", user.id)
-        .single();
-      if (data) {
-        setDisplayName(data.display_name || "");
-        setBio(data.bio || "");
+      const res = await fetch("/api/profile");
+      const data = await res.json().catch(() => null);
+      if (data?.profile) {
+        setDisplayName(data.profile.display_name || "");
+        setBio(data.profile.bio || "");
       }
       setLoading(false);
     };
@@ -40,16 +35,24 @@ function SettingsContent() {
   const handleSave = async () => {
     if (!user) return;
     setSaving(true);
-    const supabase = await createClient();
-    if (!supabase) { setSaving(false); return; }
-    const { error } = await supabase
-      .from("profiles")
-      .upsert({ id: user.id, display_name: displayName, bio });
-    setSaving(false);
-    if (error) {
-      toast.error("Failed to save", error.message);
-    } else {
+    try {
+      const res = await fetch("/api/profile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ displayName, bio }),
+      });
+      const data = await res.json();
+      setSaving(false);
+      if (!res.ok) {
+        toast.error("Failed to save", data.error || "Please try again");
+        return;
+      }
+      setDisplayName(data.profile?.display_name ?? displayName);
+      setBio(data.profile?.bio ?? bio);
       toast.success("Profile updated");
+    } catch {
+      setSaving(false);
+      toast.error("Failed to save", "Network error, please try again");
     }
   };
 
