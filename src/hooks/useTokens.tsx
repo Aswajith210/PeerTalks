@@ -40,14 +40,15 @@ export function TokensProvider({ children }: { children: React.ReactNode }) {
   const wireGenRef = useRef(0);
   const refreshIdRef = useRef(0);
 
-  const applyBalance = useCallback((balance: number) => {
+  const applyDisplay = useCallback((balance: number, source: "db" | "server" | "realtime") => {
+    console.log("[tokens] displaying balance", { balance, source });
     setState({ balance, loading: false, error: null });
   }, []);
 
-  const fetchBalance = useCallback(async () => {
+  const fetchBalance = useCallback(async (): Promise<boolean> => {
     const supabase = supabaseRef.current;
     const userId = userIdRef.current;
-    if (!supabase || !userId) return;
+    if (!supabase || !userId) return false;
     const id = ++refreshIdRef.current;
     console.log("[tokens] fetching balance", { userId });
     const { data, error } = await supabase
@@ -55,17 +56,20 @@ export function TokensProvider({ children }: { children: React.ReactNode }) {
       .select("balance")
       .eq("user_id", userId)
       .maybeSingle();
-    if (id !== refreshIdRef.current) return;
+    if (id !== refreshIdRef.current) return false;
     if (error) {
-      console.error("[tokens] balance fetch error", { userId, message: error.message });
+      console.error("[tokens] direct balance fetch error", { userId, message: error.message });
       setState((s) => ({ ...s, loading: false, error: error.message }));
-    } else {
-      console.log("[tokens] balance fetched", { userId, balance: data?.balance ?? 0 });
-      applyBalance(data?.balance ?? 0);
+      return false;
     }
-  }, [applyBalance]);
+    console.log("[tokens] direct balance fetched", { userId, balance: data?.balance ?? 0 });
+    applyDisplay(data?.balance ?? 0, "db");
+    return true;
+  }, [applyDisplay]);
 
-  const refresh = useCallback(() => fetchBalance(), [fetchBalance]);
+  const refresh = useCallback(async () => {
+    await fetchBalance();
+  }, [fetchBalance]);
 
   useEffect(() => {
     let mounted = true;
@@ -79,7 +83,7 @@ export function TokensProvider({ children }: { children: React.ReactNode }) {
       }
       supabaseRef.current = supabase;
 
-      const setupForUser = async (userId: string | null) => {
+      const syncToUser = async (userId: string | null) => {
         if (!mounted) return;
         const gen = ++wireGenRef.current;
 
@@ -96,8 +100,28 @@ export function TokensProvider({ children }: { children: React.ReactNode }) {
           return;
         }
 
-        await fetchBalance();
+        const directOk = await fetchBalance();
         if (gen !== wireGenRef.current || !mounted) return;
+
+        if (!directOk) {
+          // Secondary source: server-verified read using the cookie session.
+          // Never cached, never localStorage — the DB row is the authority.
+          try {
+            const res = await fetch("/api/tokens", { cache: "no-store" });
+            if (res.ok) {
+              const body = (await res.json()) as { balance?: number };
+              if (
+                typeof body.balance === "number" &&
+                gen === wireGenRef.current &&
+                mounted
+              ) {
+                console.log("[tokens] server balance fallback", { userId, balance: body.balance });
+                applyDisplay(body.balance, "server");
+              }
+            }
+          } catch {}
+          if (gen !== wireGenRef.current || !mounted) return;
+        }
 
         const channel = supabase
           .channel(`token_balance_sync_${userId}`)
@@ -111,7 +135,7 @@ export function TokensProvider({ children }: { children: React.ReactNode }) {
             },
             (payload: { new?: Record<string, unknown> | null }) => {
               if (payload.new && "balance" in payload.new) {
-                applyBalance(payload.new.balance as number);
+                applyDisplay(payload.new.balance as number, "realtime");
               }
             }
           )
@@ -130,22 +154,40 @@ export function TokensProvider({ children }: { children: React.ReactNode }) {
         channelRef.current = channel;
       };
 
-      const { data: { session } } = await supabase.auth.getSession();
-      console.log("[tokens] provider session resolved", { userId: session?.user.id ?? null });
-      await setupForUser(session?.user.id ?? null);
-
+      // 1) Register the auth listener FIRST so no restore/login/logout event
+      //    can happen before it exists (getSession may resolve BEFORE the
+      //    remounted client finishes restoring cookies on a hard refresh).
       const { data: { subscription } } = supabase.auth.onAuthStateChange(
         (event, session) => {
           const nextUserId = session?.user.id ?? null;
-          console.log("[tokens] auth change", {
+          console.log("[tokens] auth event", {
             event, nextUserId, previousUserId: userIdRef.current,
           });
+          if (!mounted) return;
           if (nextUserId !== userIdRef.current) {
-            void setupForUser(nextUserId);
+            void syncToUser(nextUserId);
           }
         }
       );
       authSubscription = subscription;
+
+      // 2) Resolve identity against the AUTH SERVER — validates the JWT and
+      //    refreshes it if needed, so this is never a stale in-memory/cookie
+      //    session or a previous account's cached user.
+      try {
+        const { data: { user } } = await supabase.auth.getUser();
+        console.log("[tokens] identity resolved (getUser)", { userId: user?.id ?? null });
+        if (mounted) await syncToUser(user?.id ?? null);
+      } catch (userError) {
+        console.error("[tokens] getUser failed, falling back to getSession", {
+          message: (userError as Error).message,
+        });
+        const { data: { session } } = await supabase.auth.getSession();
+        console.log("[tokens] identity resolved (getSession fallback)", {
+          userId: session?.user.id ?? null,
+        });
+        if (mounted) await syncToUser(session?.user.id ?? null);
+      }
     };
 
     void wire();
@@ -160,7 +202,7 @@ export function TokensProvider({ children }: { children: React.ReactNode }) {
       supabaseRef.current = null;
       userIdRef.current = null;
     };
-  }, [applyBalance, fetchBalance]);
+  }, [applyDisplay, fetchBalance]);
 
   const hasEnough = useCallback(
     (amount: number) => state.balance >= amount,
