@@ -1,5 +1,5 @@
 import { createServerSupabaseClient } from "@/lib/supabase/server";
-import { deductTokens, refundTokens } from "@/lib/tokens";
+import { deductTokens, refundTokens, parseRequestKey, refundKeyFor } from "@/lib/tokens";
 import { NextResponse } from "next/server";
 import bcrypt from "bcryptjs";
 import { validateInput, schemas } from "@/lib/validations";
@@ -15,6 +15,11 @@ export async function POST(request: Request) {
 
   if (!session) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const requestKey = parseRequestKey(request);
+  if (!requestKey) {
+    return NextResponse.json({ error: "Missing or invalid idempotency key" }, { status: 400 });
   }
 
   const body = await request.json();
@@ -45,7 +50,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Room is full" }, { status: 400 });
   }
 
-  const deduction = await deductTokens(session.user.id, 5, "Private room");
+  const deduction = await deductTokens(
+    session.user.id,
+    5,
+    "Private room",
+    undefined,
+    requestKey
+  );
   if (!deduction.success) {
     return NextResponse.json(
       { error: "Insufficient tokens", balance: deduction.balance },
@@ -73,14 +84,14 @@ export async function POST(request: Request) {
     if (joinError.code === "PGRST202") {
       // Function not deployed — fall through to direct updates below.
     } else {
-      await refundTokens(session.user.id, 5, undefined);
+      await refundTokens(session.user.id, 5, undefined, refundKeyFor(requestKey));
       return NextResponse.json(
         { error: "Failed to join room" },
         { status: 500 }
       );
     }
   } else if (!joinResult?.success) {
-    await refundTokens(session.user.id, 5, undefined);
+    await refundTokens(session.user.id, 5, undefined, refundKeyFor(requestKey));
     return NextResponse.json(
       { error: joinResult?.error ?? "Room not found or already full" },
       { status: 400 }
@@ -96,7 +107,7 @@ export async function POST(request: Request) {
     .is("guest_id", null);
 
   if (updateError) {
-    await refundTokens(session.user.id, 5, undefined);
+    await refundTokens(session.user.id, 5, undefined, refundKeyFor(requestKey));
     return NextResponse.json({ error: "Failed to join room" }, { status: 500 });
   }
 
@@ -132,7 +143,7 @@ export async function POST(request: Request) {
   }
 
   if (!sessionId) {
-    await refundTokens(session.user.id, 5, undefined);
+    await refundTokens(session.user.id, 5, undefined, refundKeyFor(requestKey));
     return NextResponse.json({ error: "Failed to create chat session" }, { status: 500 });
   }
 

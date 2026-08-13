@@ -1,11 +1,11 @@
 import { createServerSupabaseClient } from "@/lib/supabase/server";
-import { deductTokens, refundTokens } from "@/lib/tokens";
+import { deductTokens, refundTokens, parseRequestKey, refundKeyFor } from "@/lib/tokens";
 import { NextResponse } from "next/server";
 import bcrypt from "bcryptjs";
 import { validateInput, schemas } from "@/lib/validations";
 
-async function refundOnError(userId: string) {
-  await refundTokens(userId, 5, undefined);
+async function refundOnError(userId: string, requestKey: string) {
+  await refundTokens(userId, 5, undefined, refundKeyFor(requestKey));
 }
 
 export async function POST(request: Request) {
@@ -21,6 +21,11 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const requestKey = parseRequestKey(request);
+  if (!requestKey) {
+    return NextResponse.json({ error: "Missing or invalid idempotency key" }, { status: 400 });
+  }
+
   const body = await request.json();
   const validationError = validateInput(body, schemas.createRoom);
   if (validationError) {
@@ -29,7 +34,13 @@ export async function POST(request: Request) {
 
   const { name, password } = body;
 
-  const deduction = await deductTokens(session.user.id, 5, "Private room");
+  const deduction = await deductTokens(
+    session.user.id,
+    5,
+    "Private room",
+    undefined,
+    requestKey
+  );
   if (!deduction.success) {
     return NextResponse.json(
       { error: "Insufficient tokens", balance: deduction.balance },
@@ -50,7 +61,7 @@ export async function POST(request: Request) {
     .single();
 
   if (!room) {
-    await refundOnError(session.user.id);
+    await refundOnError(session.user.id, requestKey);
     if (roomError?.code === "23505") {
       return NextResponse.json(
         { error: "A room with this name already exists. Choose another name." },
@@ -74,7 +85,7 @@ export async function POST(request: Request) {
   if (!chatSession) {
     // Room created but session failed — clean up
     await supabase.from("private_rooms").delete().eq("id", room.id);
-    await refundOnError(session.user.id);
+    await refundOnError(session.user.id, requestKey);
     return NextResponse.json({ error: "Failed to create chat session" }, { status: 500 });
   }
 

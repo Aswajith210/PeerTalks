@@ -112,7 +112,11 @@ function InterestChatContent() {
 
       const res = await fetch("/api/matching/interest", {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-call-type": callType },
+        headers: {
+          "Content-Type": "application/json",
+          "x-call-type": callType,
+          "x-request-id": globalThis.crypto.randomUUID(),
+        },
         body: JSON.stringify({ interests }),
       });
       const data = await res.json();

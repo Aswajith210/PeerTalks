@@ -1,11 +1,17 @@
 import { createServerSupabaseClient } from "@/lib/supabase/server";
-import { deductTokens, refundTokens } from "@/lib/tokens";
+import { deductTokens, refundTokens, parseRequestKey } from "@/lib/tokens";
 import { TOKEN_COSTS } from "@/lib/constants";
 import { NextResponse } from "next/server";
 import { validateInput, schemas } from "@/lib/validations";
 
-async function deduct(userId: string) {
-  return deductTokens(userId, TOKEN_COSTS.VIDEO_CHAT, "Interest-based chat");
+async function deduct(userId: string, requestKey: string) {
+  return deductTokens(
+    userId,
+    TOKEN_COSTS.VIDEO_CHAT,
+    "Interest-based chat",
+    undefined,
+    requestKey
+  );
 }
 
 export async function POST(request: Request) {
@@ -13,6 +19,11 @@ export async function POST(request: Request) {
   if (!supabase) return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
   const { data: { session } } = await supabase.auth.getSession();
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+  const requestKey = parseRequestKey(request);
+  if (!requestKey) {
+    return NextResponse.json({ error: "Missing or invalid idempotency key" }, { status: 400 });
+  }
 
   const body = await request.json();
   const validationError = validateInput(body, schemas.matchingInterest);
@@ -34,7 +45,16 @@ export async function POST(request: Request) {
     );
   }
 
-  const deduction = await deduct(userId);
+  // Clear orphaned waiting rows from lost-response attempts (see random).
+  await supabase
+    .from("matching_queue")
+    .delete()
+    .eq("user_id", userId)
+    .eq("mode", "interest")
+    .eq("status", "waiting")
+    .lt("created_at", new Date(Date.now() - 120_000).toISOString());
+
+  const deduction = await deduct(userId, requestKey);
   if (!deduction.success) {
     return NextResponse.json({ error: "Insufficient tokens", balance: deduction.balance }, { status: 400 });
   }
@@ -121,8 +141,18 @@ export async function DELETE() {
   const { data: { session } } = await supabase.auth.getSession();
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  await supabase.from("matching_queue").delete()
-    .eq("user_id", session.user.id).eq("status", "waiting");
-  const refund = await refundTokens(session.user.id, TOKEN_COSTS.VIDEO_CHAT, undefined);
-  return NextResponse.json({ success: refund.success });
+  // Refund ONLY when a waiting entry was actually removed (see random route).
+  const { data: deleted } = await supabase
+    .from("matching_queue")
+    .delete({ count: "exact" })
+    .eq("user_id", session.user.id)
+    .eq("mode", "interest")
+    .eq("status", "waiting")
+    .select("id");
+
+  if (deleted && deleted.length > 0) {
+    const refund = await refundTokens(session.user.id, TOKEN_COSTS.VIDEO_CHAT);
+    return NextResponse.json({ success: refund.success, refunded: true });
+  }
+  return NextResponse.json({ success: true, refunded: false });
 }

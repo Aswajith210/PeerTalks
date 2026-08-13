@@ -5,11 +5,33 @@ export interface TokenResult {
   success: boolean;
   balance: number;
   reason?: string;
+  /** true when the request was an exact replay of a completed operation */
+  idempotent?: boolean;
 }
 
 export interface DailyClaimResult {
   claimed: boolean;
   balance: number;
+}
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const REFUND_KEY_PREFIX = "refund:";
+
+/**
+ * Reads the client-supplied idempotency key (`x-request-id` header).
+ * A valid key must be a plain UUID. Refunds derive their own distinct key
+ * from it (`refund:<uuid>`) so a charge and its reversal never collide.
+ */
+export function parseRequestKey(request: Request): string | null {
+  const raw = request.headers.get("x-request-id");
+  if (!raw) return null;
+  const key = raw.trim().toLowerCase();
+  return UUID_RE.test(key) ? key : null;
+}
+
+export function refundKeyFor(key: string): string {
+  return `${REFUND_KEY_PREFIX}${key}`;
 }
 
 export async function getUserTokenBalance(userId: string): Promise<number> {
@@ -145,7 +167,8 @@ export async function deductTokens(
   userId: string,
   amount: number,
   description: string,
-  sessionId?: string
+  sessionId?: string,
+  idempotencyKey?: string
 ): Promise<TokenResult> {
   const supabase = await createServerSupabaseClient();
   if (!supabase) throw new Error("Server configuration error");
@@ -156,14 +179,40 @@ export async function deductTokens(
     p_type: amount >= 0 ? "chat_cost" : "refund",
     p_description: description,
     p_session_id: sessionId ?? null,
+    p_idempotency_key: idempotencyKey ?? null,
   });
 
   if (!error && data) {
-    const r = data as { success?: boolean; balance?: number; reason?: string };
-    return { success: r.success === true, balance: r.balance ?? 0, reason: r.reason };
+    const r = data as { success?: boolean; balance?: number; reason?: string; idempotent?: boolean };
+    return {
+      success: r.success === true,
+      balance: r.balance ?? 0,
+      reason: r.reason,
+      idempotent: r.idempotent === true,
+    };
   }
 
   // ── Fallback: optimistic locking on the balance column ──
+  // First honor idempotency: if this exact operation already committed,
+  // replay it as a no-op so retried requests never double-charge.
+  if (idempotencyKey) {
+    const { data: existing } = await supabase
+      .from("token_transactions")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("idempotency_key", idempotencyKey)
+      .maybeSingle();
+
+    if (existing) {
+      const { data: knownBalance } = await supabase
+        .from("token_balances")
+        .select("balance")
+        .eq("user_id", userId)
+        .maybeSingle();
+      return { success: true, balance: knownBalance?.balance ?? 0, idempotent: true };
+    }
+  }
+
   for (let attempt = 0; attempt < 3; attempt++) {
     const { data: balance } = await supabase
       .from("token_balances")
@@ -186,13 +235,18 @@ export async function deductTokens(
       .maybeSingle();
 
     if (updated) {
-      await supabase.from("token_transactions").insert({
+      const { error: txError } = await supabase.from("token_transactions").insert({
         user_id: userId,
         amount: -amount,
         type: amount >= 0 ? "chat_cost" : "refund",
         description,
         session_id: sessionId ?? null,
+        idempotency_key: idempotencyKey ?? null,
       });
+      if (txError?.code === "23505") {
+        // A concurrent request committed this key first — same outcome.
+        return { success: true, balance: newBalance, idempotent: true };
+      }
       return { success: true, balance: newBalance };
     }
   }
@@ -208,9 +262,10 @@ export async function deductTokens(
 export async function refundTokens(
   userId: string,
   amount: number,
-  sessionId?: string
+  sessionId?: string,
+  idempotencyKey?: string
 ): Promise<TokenResult> {
-  return deductTokens(userId, -amount, "Token refund", sessionId);
+  return deductTokens(userId, -amount, "Token refund", sessionId, idempotencyKey);
 }
 
 export function getChatCost(mode: "video" | "text"): number {

@@ -98,7 +98,10 @@ function RandomChatContent() {
 
       const res = await fetch("/api/matching/random", {
         method: "POST",
-        headers: { "x-call-type": callType },
+        headers: {
+          "x-call-type": callType,
+          "x-request-id": globalThis.crypto.randomUUID(),
+        },
       });
       const data = await res.json();
 

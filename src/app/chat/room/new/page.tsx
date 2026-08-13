@@ -28,7 +28,10 @@ function PrivateRoomContent() {
     try {
       const res = await fetch("/api/rooms/create", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-request-id": globalThis.crypto.randomUUID(),
+        },
         body: JSON.stringify({ name, password }),
       });
       const data = await res.json();
@@ -57,7 +60,10 @@ function PrivateRoomContent() {
     try {
       const res = await fetch("/api/rooms/join", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-request-id": globalThis.crypto.randomUUID(),
+        },
         body: JSON.stringify({ name, password }),
       });
       const data = await res.json();

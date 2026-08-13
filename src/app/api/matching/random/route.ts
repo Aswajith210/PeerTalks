@@ -1,10 +1,20 @@
 import { createServerSupabaseClient } from "@/lib/supabase/server";
-import { deductTokens, refundTokens } from "@/lib/tokens";
+import {
+  deductTokens,
+  refundTokens,
+  parseRequestKey,
+} from "@/lib/tokens";
 import { TOKEN_COSTS } from "@/lib/constants";
 import { NextResponse } from "next/server";
 
-async function deduct(userId: string) {
-  return deductTokens(userId, TOKEN_COSTS.VIDEO_CHAT, "Random chat");
+async function deduct(userId: string, requestKey: string) {
+  return deductTokens(
+    userId,
+    TOKEN_COSTS.VIDEO_CHAT,
+    "Random chat",
+    undefined,
+    requestKey
+  );
 }
 
 export async function POST(request: Request) {
@@ -13,13 +23,32 @@ export async function POST(request: Request) {
   const { data: { session } } = await supabase.auth.getSession();
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
+  // The client supplies a per-attempt key (UUID). The SAME key replayed
+  // (network retry, double-click) can never deduct twice.
+  const requestKey = parseRequestKey(request);
+  if (!requestKey) {
+    return NextResponse.json({ error: "Missing or invalid idempotency key" }, { status: 400 });
+  }
+
   const callType = request.headers.get("x-call-type") ?? "video";
   if (callType !== "video" && callType !== "text") {
     return NextResponse.json({ error: "Invalid call type" }, { status: 400 });
   }
 
   const userId = session.user.id;
-  const deduction = await deduct(userId);
+
+  // Clear orphaned waiting rows from attempts whose response was lost
+  // (e.g. a retried POST that queued but never got a reply). Rows newer
+  // than the matching timeout are live attempts — never touch those.
+  await supabase
+    .from("matching_queue")
+    .delete()
+    .eq("user_id", userId)
+    .eq("mode", "random")
+    .eq("status", "waiting")
+    .lt("created_at", new Date(Date.now() - 120_000).toISOString());
+
+  const deduction = await deduct(userId, requestKey);
   if (!deduction.success) {
     return NextResponse.json({ error: "Insufficient tokens", balance: deduction.balance }, { status: 400 });
   }
@@ -103,8 +132,21 @@ export async function DELETE() {
   const { data: { session } } = await supabase.auth.getSession();
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  await supabase.from("matching_queue").delete()
-    .eq("user_id", session.user.id).eq("status", "waiting");
-  const refund = await refundTokens(session.user.id, TOKEN_COSTS.VIDEO_CHAT, undefined);
-  return NextResponse.json({ success: refund.success });
+  // Refund ONLY when a waiting queue entry was actually removed. A user who
+  // already matched (entry status=matched) or already cancelled (no row)
+  // must NOT be refunded — otherwise every matched chat refunds itself and
+  // a repeated DELETE(double-cancel / page unmount) refunds again.
+  const { data: deleted } = await supabase
+    .from("matching_queue")
+    .delete({ count: "exact" })
+    .eq("user_id", session.user.id)
+    .eq("mode", "random")
+    .eq("status", "waiting")
+    .select("id");
+
+  if (deleted && deleted.length > 0) {
+    const refund = await refundTokens(session.user.id, TOKEN_COSTS.VIDEO_CHAT);
+    return NextResponse.json({ success: refund.success, refunded: true });
+  }
+  return NextResponse.json({ success: true, refunded: false });
 }
