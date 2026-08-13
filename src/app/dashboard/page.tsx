@@ -67,7 +67,12 @@ function DashboardContent() {
       if (!user || hasClaimed.current) return;
       hasClaimed.current = true;
       try {
-        const res = await fetch("/api/tokens/claim", { method: "POST" });
+        const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+        const res = await fetch("/api/tokens/claim", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tz }),
+        });
         const data = await res.json();
         if (data.claimed) {
           toast.success("Daily tokens claimed!", `${data.balance} tokens available`);

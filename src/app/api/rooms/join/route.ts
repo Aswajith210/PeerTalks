@@ -1,5 +1,5 @@
 import { createServerSupabaseClient } from "@/lib/supabase/server";
-import { deductTokens } from "@/lib/tokens";
+import { deductTokens, refundTokens } from "@/lib/tokens";
 import { NextResponse } from "next/server";
 import bcrypt from "bcryptjs";
 import { validateInput, schemas } from "@/lib/validations";
@@ -67,15 +67,24 @@ export async function POST(request: Request) {
     });
   }
 
-  // RPC failed or not available — fallback to direct updates
+  // Failure after the 5-token charge — refund so the user only pays when
+  // the private session actually starts.
   if (joinError) {
-    // Only fallback for "function not found"; other errors are real failures
-    if (joinError.code !== "PGRST202") {
+    if (joinError.code === "PGRST202") {
+      // Function not deployed — fall through to direct updates below.
+    } else {
+      await refundTokens(session.user.id, 5, undefined);
       return NextResponse.json(
         { error: "Failed to join room" },
         { status: 500 }
       );
     }
+  } else if (!joinResult?.success) {
+    await refundTokens(session.user.id, 5, undefined);
+    return NextResponse.json(
+      { error: joinResult?.error ?? "Room not found or already full" },
+      { status: 400 }
+    );
   }
 
   // Fallback: direct update
@@ -87,6 +96,7 @@ export async function POST(request: Request) {
     .is("guest_id", null);
 
   if (updateError) {
+    await refundTokens(session.user.id, 5, undefined);
     return NextResponse.json({ error: "Failed to join room" }, { status: 500 });
   }
 
@@ -122,6 +132,7 @@ export async function POST(request: Request) {
   }
 
   if (!sessionId) {
+    await refundTokens(session.user.id, 5, undefined);
     return NextResponse.json({ error: "Failed to create chat session" }, { status: 500 });
   }
 

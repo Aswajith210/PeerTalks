@@ -1,19 +1,11 @@
 import { createServerSupabaseClient } from "@/lib/supabase/server";
-import { deductTokens as deductTokensFallback, refundTokens } from "@/lib/tokens";
+import { deductTokens, refundTokens } from "@/lib/tokens";
+import { TOKEN_COSTS } from "@/lib/constants";
 import { NextResponse } from "next/server";
 import { validateInput, schemas } from "@/lib/validations";
 
 async function deduct(userId: string) {
-  const supabase = await createServerSupabaseClient();
-  if (!supabase) return { success: false as const, balance: 0 };
-  const { data, error } = await supabase.rpc("deduct_tokens", {
-    p_user_id: userId, p_amount: 2, p_type: "chat_cost",
-    p_description: "Interest-based chat", p_session_id: null,
-  });
-  if (error) return deductTokensFallback(userId, 2, "Interest-based chat");
-  const r = data as Record<string, unknown> | null;
-  if (r?.success) return { success: true as const, balance: (r.balance as number) ?? 0 };
-  return { success: false as const, balance: (r?.balance as number) ?? 0 };
+  return deductTokens(userId, TOKEN_COSTS.VIDEO_CHAT, "Interest-based chat");
 }
 
 export async function POST(request: Request) {
@@ -131,6 +123,6 @@ export async function DELETE() {
 
   await supabase.from("matching_queue").delete()
     .eq("user_id", session.user.id).eq("status", "waiting");
-  await refundTokens(session.user.id, 2, undefined);
-  return NextResponse.json({ success: true });
+  const refund = await refundTokens(session.user.id, TOKEN_COSTS.VIDEO_CHAT, undefined);
+  return NextResponse.json({ success: refund.success });
 }

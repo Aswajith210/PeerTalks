@@ -77,7 +77,13 @@ export function useTokens() {
             }
           }
         )
-        .subscribe();
+        .subscribe((status) => {
+          // Non-fatal: token balance simply falls back to manual refreshes
+          // (the balance is re-fetched above on every mount).
+          if (status === "CHANNEL_ERROR" && mountedRef.current) {
+            setState((s) => ({ ...s, loading: false }));
+          }
+        });
 
       if (mountedRef.current) {
         channelRef.current = channel;

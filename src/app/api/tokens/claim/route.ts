@@ -2,7 +2,9 @@ import { createServerSupabaseClient } from "@/lib/supabase/server";
 import { ensureDailyTokens, getUserTokenBalance } from "@/lib/tokens";
 import { NextResponse } from "next/server";
 
-export async function POST() {
+const SAFE_TZ = /^[A-Za-z0-9_+\-/]{2,64}$/;
+
+export async function POST(request: Request) {
   const supabase = await createServerSupabaseClient();
   if (!supabase) {
     return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
@@ -15,10 +17,17 @@ export async function POST() {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const body = await request.json().catch(() => ({}));
+  const tz =
+    typeof body?.tz === "string" && SAFE_TZ.test(body.tz) ? body.tz : "UTC";
+
   try {
-    await ensureDailyTokens(session.user.id);
+    const result = await ensureDailyTokens(session.user.id, tz);
     const balance = await getUserTokenBalance(session.user.id);
-    return NextResponse.json({ claimed: true, balance });
+    return NextResponse.json({
+      claimed: result.claimed,
+      balance: result.claimed ? result.balance : balance,
+    });
   } catch {
     return NextResponse.json({ error: "Failed to claim daily tokens" }, { status: 500 });
   }

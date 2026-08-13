@@ -1,6 +1,17 @@
 import { createServerSupabaseClient } from "./supabase/server";
 import { TOKEN_COSTS, TOKEN_ALLOWANCE } from "./constants";
 
+export interface TokenResult {
+  success: boolean;
+  balance: number;
+  reason?: string;
+}
+
+export interface DailyClaimResult {
+  claimed: boolean;
+  balance: number;
+}
+
 export async function getUserTokenBalance(userId: string): Promise<number> {
   const supabase = await createServerSupabaseClient();
   if (!supabase) throw new Error("Server configuration error");
@@ -8,155 +19,198 @@ export async function getUserTokenBalance(userId: string): Promise<number> {
     .from("token_balances")
     .select("balance")
     .eq("user_id", userId)
-    .single();
+    .maybeSingle();
   return data?.balance ?? 0;
 }
 
-export async function ensureDailyTokens(userId: string): Promise<void> {
+/**
+ * Today's boundary (start of calendar day) as a Date in the given timezone.
+ * The caller supplies the user's IANA timezone (e.g. "Asia/Kolkata") so the
+ * "calendar day" is the USER's calendar day, not UTC.
+ */
+function todayInTimezone(tz: string): Date {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const get = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((p) => p.type === type)?.value ?? "";
+  return new Date(`${get("year")}-${get("month")}-${get("day")}T00:00:00Z`);
+}
+
+/**
+ * Atomic daily grant: EXACTLY +20 once per calendar day.
+ *
+ * Primary path: the `claim_daily_tokens` DB function (row-locked, calendar-day,
+ * caller-verified). Fallback (function/tables not yet deployed): an optimistic
+ * conditional update keyed on last_daily_at, retried on any concurrent change —
+ * two simultaneous requests can still produce at most one +20 grant.
+ */
+export async function ensureDailyTokens(
+  userId: string,
+  tz: string = "UTC"
+): Promise<DailyClaimResult> {
   const supabase = await createServerSupabaseClient();
   if (!supabase) throw new Error("Server configuration error");
 
-  // Use the atomic RPC function
-  const { data } = await supabase.rpc("claim_daily_tokens", {
+  const { data, error } = await supabase.rpc("claim_daily_tokens", {
     p_user_id: userId,
     p_amount: TOKEN_ALLOWANCE.AMOUNT,
+    p_timezone: tz,
   });
 
-  if (data?.success !== true) {
-    // Fallback: try application-level logic
+  if (!error && data) {
+    const r = data as { success?: boolean; claimed?: boolean; balance?: number };
+    if (r.success) {
+      return { claimed: r.claimed === true, balance: r.balance ?? 0 };
+    }
+  }
+
+  // ── Fallback: optimistic conditional update (atomic under READ COMMITTED) ──
+  const today = todayInTimezone(tz);
+  for (let attempt = 0; attempt < 3; attempt++) {
     const { data: balance } = await supabase
       .from("token_balances")
       .select("balance, last_daily_at")
       .eq("user_id", userId)
-      .single();
+      .maybeSingle();
 
     if (!balance) {
-      await supabase.from("token_balances").insert({
+      // Row missing: try to seed it. Concurrent inserts collide on the PK —
+      // on collision a concurrent grant already happened, so loop and re-check.
+      const { error: insertError } = await supabase.from("token_balances").insert({
         user_id: userId,
         balance: TOKEN_ALLOWANCE.AMOUNT,
         last_daily_at: new Date().toISOString(),
       });
-      await supabase.from("token_transactions").insert({
-        user_id: userId,
-        amount: TOKEN_ALLOWANCE.AMOUNT,
-        type: "daily_allowance",
-        description: "Welcome bonus",
-      });
-      return;
+      if (!insertError) {
+        await supabase.from("token_transactions").insert({
+          user_id: userId,
+          amount: TOKEN_ALLOWANCE.AMOUNT,
+          type: "daily_allowance",
+          description: "Daily token allowance",
+        });
+        return { claimed: true, balance: TOKEN_ALLOWANCE.AMOUNT };
+      }
+      continue;
     }
 
     const lastDaily = new Date(balance.last_daily_at);
-    const now = new Date();
-    const hoursSinceLastDaily =
-      (now.getTime() - lastDaily.getTime()) / (1000 * 60 * 60);
+    if (lastDaily >= today) {
+      return { claimed: false, balance: balance.balance };
+    }
 
-    if (hoursSinceLastDaily >= TOKEN_ALLOWANCE.INTERVAL_HOURS) {
-      const newBalance = balance.balance + TOKEN_ALLOWANCE.AMOUNT;
-      await supabase
-        .from("token_balances")
-        .update({
-          balance: newBalance,
-          last_daily_at: now.toISOString(),
-          updated_at: now.toISOString(),
-        })
-        .eq("user_id", userId);
+    const newBalance = balance.balance + TOKEN_ALLOWANCE.AMOUNT;
+    const { data: updated } = await supabase
+      .from("token_balances")
+      .update({
+        balance: newBalance,
+        last_daily_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("user_id", userId)
+      .eq("last_daily_at", balance.last_daily_at)
+      .select("balance")
+      .maybeSingle();
 
+    if (updated) {
       await supabase.from("token_transactions").insert({
         user_id: userId,
         amount: TOKEN_ALLOWANCE.AMOUNT,
         type: "daily_allowance",
         description: "Daily token allowance",
       });
+      return { claimed: true, balance: newBalance };
     }
+    // Concurrent change detected — retry with fresh values.
   }
+
+  const { data: finalBalance } = await supabase
+    .from("token_balances")
+    .select("balance")
+    .eq("user_id", userId)
+    .maybeSingle();
+  return { claimed: false, balance: finalBalance?.balance ?? 0 };
 }
 
+/**
+ * Atomic deduction via the `deduct_tokens` DB function (row-locked).
+ * Fallback: optimistic update keyed on the read balance, retried on change —
+ * two simultaneous deductions can never consume the same tokens twice.
+ * Positive amount = charge, negative amount = refund (atomic add).
+ */
 export async function deductTokens(
   userId: string,
   amount: number,
   description: string,
   sessionId?: string
-): Promise<{ success: boolean; balance: number }> {
+): Promise<TokenResult> {
   const supabase = await createServerSupabaseClient();
   if (!supabase) throw new Error("Server configuration error");
 
-  // Try the atomic RPC first
-  const { data } = await supabase.rpc("deduct_tokens", {
+  const { data, error } = await supabase.rpc("deduct_tokens", {
     p_user_id: userId,
     p_amount: amount,
-    p_type: "chat_cost",
+    p_type: amount >= 0 ? "chat_cost" : "refund",
     p_description: description,
     p_session_id: sessionId ?? null,
   });
 
-  if (data) {
-    return { success: data.success as boolean, balance: (data.balance as number) ?? 0 };
+  if (!error && data) {
+    const r = data as { success?: boolean; balance?: number; reason?: string };
+    return { success: r.success === true, balance: r.balance ?? 0, reason: r.reason };
   }
 
-  // Fallback: application-level deduction
-  const { data: balance } = await supabase
+  // ── Fallback: optimistic locking on the balance column ──
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { data: balance } = await supabase
+      .from("token_balances")
+      .select("balance")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    const current = balance?.balance ?? 0;
+    if (amount > 0 && current < amount) {
+      return { success: false, balance: current, reason: "insufficient" };
+    }
+
+    const newBalance = current + amount;
+    const { data: updated } = await supabase
+      .from("token_balances")
+      .update({ balance: newBalance, updated_at: new Date().toISOString() })
+      .eq("user_id", userId)
+      .eq("balance", current)
+      .select("balance")
+      .maybeSingle();
+
+    if (updated) {
+      await supabase.from("token_transactions").insert({
+        user_id: userId,
+        amount: -amount,
+        type: amount >= 0 ? "chat_cost" : "refund",
+        description,
+        session_id: sessionId ?? null,
+      });
+      return { success: true, balance: newBalance };
+    }
+  }
+
+  const { data: finalBalance } = await supabase
     .from("token_balances")
     .select("balance")
     .eq("user_id", userId)
-    .single();
-
-  if (!balance || balance.balance < amount) {
-    return { success: false, balance: balance?.balance ?? 0 };
-  }
-
-  const newBalance = balance.balance - amount;
-
-  await supabase
-    .from("token_balances")
-    .update({
-      balance: newBalance,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("user_id", userId);
-
-  await supabase.from("token_transactions").insert({
-    user_id: userId,
-    amount: -amount,
-    type: "chat_cost",
-    description,
-    session_id: sessionId ?? null,
-  });
-
-  return { success: true, balance: newBalance };
+    .maybeSingle();
+  return { success: false, balance: finalBalance?.balance ?? 0 };
 }
 
 export async function refundTokens(
   userId: string,
   amount: number,
   sessionId?: string
-): Promise<void> {
-  const supabase = await createServerSupabaseClient();
-  if (!supabase) throw new Error("Server configuration error");
-
-  // Refund is always safe (no race condition on adding tokens)
-  const { data: balance } = await supabase
-    .from("token_balances")
-    .select("balance")
-    .eq("user_id", userId)
-    .single();
-
-  const newBalance = (balance?.balance ?? 0) + amount;
-
-  await supabase
-    .from("token_balances")
-    .update({
-      balance: newBalance,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("user_id", userId);
-
-  await supabase.from("token_transactions").insert({
-    user_id: userId,
-    amount,
-    type: "refund",
-    description: "Token refund",
-    session_id: sessionId ?? null,
-  });
+): Promise<TokenResult> {
+  return deductTokens(userId, -amount, "Token refund", sessionId);
 }
 
 export function getChatCost(mode: "video" | "text"): number {

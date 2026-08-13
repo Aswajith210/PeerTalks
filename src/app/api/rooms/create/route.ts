@@ -1,17 +1,11 @@
 import { createServerSupabaseClient } from "@/lib/supabase/server";
-import { deductTokens } from "@/lib/tokens";
+import { deductTokens, refundTokens } from "@/lib/tokens";
 import { NextResponse } from "next/server";
 import bcrypt from "bcryptjs";
 import { validateInput, schemas } from "@/lib/validations";
 
-async function refundOnError(supabase: NonNullable<Awaited<ReturnType<typeof createServerSupabaseClient>>>, userId: string) {
-  await supabase.rpc("deduct_tokens", {
-    p_user_id: userId,
-    p_amount: -5,
-    p_type: "refund",
-    p_description: "Room creation failed - token refund",
-    p_session_id: null,
-  });
+async function refundOnError(userId: string) {
+  await refundTokens(userId, 5, undefined);
 }
 
 export async function POST(request: Request) {
@@ -45,7 +39,7 @@ export async function POST(request: Request) {
 
   const passwordHash = await bcrypt.hash(password, 10);
 
-  const { data: room } = await supabase
+  const { data: room, error: roomError } = await supabase
     .from("private_rooms")
     .insert({
       name,
@@ -56,7 +50,13 @@ export async function POST(request: Request) {
     .single();
 
   if (!room) {
-    await refundOnError(supabase, session.user.id);
+    await refundOnError(session.user.id);
+    if (roomError?.code === "23505") {
+      return NextResponse.json(
+        { error: "A room with this name already exists. Choose another name." },
+        { status: 409 }
+      );
+    }
     return NextResponse.json({ error: "Failed to create room" }, { status: 500 });
   }
 
@@ -74,7 +74,7 @@ export async function POST(request: Request) {
   if (!chatSession) {
     // Room created but session failed — clean up
     await supabase.from("private_rooms").delete().eq("id", room.id);
-    await refundOnError(supabase, session.user.id);
+    await refundOnError(session.user.id);
     return NextResponse.json({ error: "Failed to create chat session" }, { status: 500 });
   }
 
