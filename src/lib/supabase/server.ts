@@ -6,6 +6,11 @@ export async function createServerSupabaseClient() {
   const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
   if (!supabaseUrl || !supabaseKey) {
+    console.error(
+      "[Supabase] NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY are empty in this build. " +
+        "The deployment was built without them — redeploy after setting the variables " +
+        "(this is what causes 'Invalid API key' at runtime)."
+    );
     return null;
   }
 
