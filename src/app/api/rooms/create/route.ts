@@ -60,7 +60,7 @@ export async function POST(request: Request) {
       password_hash: passwordHash,
       host_id: session.user.id,
     })
-    .select()
+    .select("id, name, host_id, guest_id, is_active, created_at, ended_at")
     .single();
 
   if (!room) {

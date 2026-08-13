@@ -23,10 +23,14 @@ export function PremiumBackground() {
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
     const resize = () => {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
+      canvas.width = Math.round(window.innerWidth * dpr);
+      canvas.height = Math.round(window.innerHeight * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     };
 
     const initParticles = () => {
@@ -42,16 +46,16 @@ export function PremiumBackground() {
     };
 
     const animate = () => {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
 
       for (const p of particlesRef.current) {
         p.x += p.vx;
         p.y += p.vy;
 
-        if (p.x < -10) p.x = canvas.width + 10;
-        if (p.x > canvas.width + 10) p.x = -10;
-        if (p.y < -10) p.y = canvas.height + 10;
-        if (p.y > canvas.height + 10) p.y = -10;
+        if (p.x < -10) p.x = window.innerWidth + 10;
+        if (p.x > window.innerWidth + 10) p.x = -10;
+        if (p.y < -10) p.y = window.innerHeight + 10;
+        if (p.y > window.innerHeight + 10) p.y = -10;
 
         ctx.beginPath();
         ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
@@ -62,14 +66,32 @@ export function PremiumBackground() {
       rafRef.current = requestAnimationFrame(animate);
     };
 
+    // Pause the loop while the tab is not visible (saves the main thread
+    // during chats/app switches); resume on visibility.
+    const onVisibility = () => {
+      cancelAnimationFrame(rafRef.current);
+      if (document.visibilityState === "visible") {
+        resize();
+        initParticles();
+        rafRef.current = requestAnimationFrame(animate);
+      }
+    };
+    const finish = () => cancelAnimationFrame(rafRef.current);
+
     resize();
     initParticles();
     animate();
 
     window.addEventListener("resize", resize);
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pagehide", finish);
+    window.addEventListener("blur", finish);
 
     return () => {
       window.removeEventListener("resize", resize);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pagehide", finish);
+      window.removeEventListener("blur", finish);
       cancelAnimationFrame(rafRef.current);
     };
   }, []);

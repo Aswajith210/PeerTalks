@@ -232,6 +232,10 @@ function ChatRoomContent() {
           setLocalStream(stream);
           localStreamRef.current = stream;
           setMediaError(null);
+        } else {
+          // Unmounted while the camera/mic permission was pending — stop
+          // the acquired stream immediately so tracks are not left on.
+          stopLocalStream(stream);
         }
       } catch {
         // Camera denied — try audio only
@@ -242,6 +246,8 @@ function ChatRoomContent() {
             localStreamRef.current = stream;
             setVideoEnabled(false);
             setMediaError(null);
+          } else {
+            stopLocalStream(stream);
           }
         } catch {
           if (!cancelled) {

@@ -30,18 +30,31 @@ export async function POST(request: Request) {
 
   const { name, password } = body;
 
-  const { data: room } = await supabase
+  const { data: roomRow } = await supabase
     .from("private_rooms")
-    .select("*")
+    .select("id, name, password_hash, host_id, guest_id, is_active, created_at, ended_at")
     .eq("name", name)
     .eq("is_active", true)
     .single();
+
+  // Never expose password_hash to the client — strip it before any return.
+  const room = roomRow
+    ? {
+        id: roomRow.id,
+        name: roomRow.name,
+        host_id: roomRow.host_id,
+        guest_id: roomRow.guest_id,
+        is_active: roomRow.is_active,
+        created_at: roomRow.created_at,
+        ended_at: roomRow.ended_at,
+      }
+    : null;
 
   if (!room) {
     return NextResponse.json({ error: "Room not found" }, { status: 404 });
   }
 
-  const valid = await bcrypt.compare(password, room.password_hash);
+  const valid = await bcrypt.compare(password, roomRow!.password_hash);
   if (!valid) {
     return NextResponse.json({ error: "Invalid password" }, { status: 403 });
   }

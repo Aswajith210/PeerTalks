@@ -57,7 +57,9 @@ export function TokensProvider({ children }: { children: React.ReactNode }) {
 
   // Revalidate: server route (authoritative, cookie identity) + direct
   // RLS-protected read of public.token_balances for the current user.
-  // Returns the live balance, or null when no user / fetch failed.
+  // NEVER downgrades a known balance to 0 based on a failed read: a value
+  // is applied only when its source succeeded. Returns the live balance,
+  // or null when no user / every read failed.
   const syncBalance = useCallback(async (): Promise<number | null> => {
     const supabase = supabaseRef.current;
     const userId = userIdRef.current;
@@ -69,7 +71,7 @@ export function TokensProvider({ children }: { children: React.ReactNode }) {
     try {
       const res = await fetch("/api/tokens", { cache: "no-store" });
       if (res.ok) {
-        const body = (await res.json()) as { balance?: number };
+        const body = (await res.json()) as { balance?: number | null };
         if (
           typeof body.balance === "number" &&
           id === refreshIdRef.current
@@ -77,6 +79,10 @@ export function TokensProvider({ children }: { children: React.ReactNode }) {
           console.log("[tokens] server balance fetched", { userId, balance: body.balance });
           applyDisplay(body.balance, "server");
           applied = body.balance;
+        } else if (id === refreshIdRef.current) {
+          console.warn("[tokens] server read returned no balance (blocked or no row)", {
+            userId, status: res.status,
+          });
         }
       }
     } catch (serverError) {
