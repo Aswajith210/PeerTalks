@@ -1,11 +1,13 @@
 "use client";
 
 import { LoginButton } from "@/components/auth/LoginButton";
+import { OAuthCodeCapture } from "@/components/auth/OAuthCodeCapture";
 import Link from "next/link";
 
 export default function LoginPage() {
   return (
     <div className="min-h-screen flex items-center justify-center px-4 relative z-10">
+      <OAuthCodeCapture />
       <div className="text-center max-w-sm">
         <Link href="/" className="inline-flex items-center gap-2 mb-8 group">
           <div className="w-9 h-9 rounded-xl bg-white/[0.04] border border-white/[0.08] flex items-center justify-center group-hover:bg-white/[0.06] transition-all duration-300">

@@ -15,6 +15,6 @@ export const config = {
     serviceRoleKey: getEnv("SUPABASE_SERVICE_ROLE_KEY") || "",
   },
   site: {
-    url: getEnv("NEXT_PUBLIC_SITE_URL") || "http://localhost:3000",
+    url: getEnv("NEXT_PUBLIC_SITE_URL") || "http://localhost:3001",
   },
 } as const;

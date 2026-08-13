@@ -13,6 +13,8 @@ export function LoginButton() {
     await supabase.auth.signInWithOAuth({
       provider: "google",
       options: {
+        // Always the CURRENT site origin — never a hardcoded/stale deployment
+        // URL. Redirects land back on whatever domain the user is on.
         redirectTo: `${window.location.origin}/api/auth/callback`,
       },
     });

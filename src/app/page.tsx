@@ -5,6 +5,7 @@ import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useRef } from "react";
 import { LoginButton } from "@/components/auth/LoginButton";
+import { OAuthCodeCapture } from "@/components/auth/OAuthCodeCapture";
 
 const HeroScene = dynamic(
   () => import("@/components/three/HeroScene").then((m) => ({ default: m.HeroScene })),
@@ -70,6 +71,7 @@ export default function Home() {
 
   return (
     <div className="relative">
+      <OAuthCodeCapture />
       {/* Hero Section */}
       <section ref={heroRef} className="relative min-h-screen flex items-center justify-center">
         <HeroScene />

@@ -11,7 +11,7 @@ export const TOKEN_ALLOWANCE = {
 
 export const MATCHING_TIMEOUT_MS = 120_000;
 
-export const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000";
+export const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3001";
 
 export const SITE_NAME = "PeerTalks";
 export const SITE_DESCRIPTION =
