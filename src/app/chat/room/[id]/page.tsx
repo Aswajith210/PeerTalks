@@ -15,6 +15,25 @@ import { useToast } from "@/hooks/useToast";
 
 const EMOJI_OPTIONS = ["👍", "❤️", "😂", "😮", "😢", "🔥", "🎉", "👏"];
 
+// Lifecycle timing. These are deliberately separate concerns:
+// - CONNECT_TIMEOUT_MS bounds how long we wait for the FIRST connection.
+// - RECONNECT_GRACE_MS is how long a known connection may stay down before
+//   it is treated as a real departure.
+// Remote-media delay NEVER ends the conversation on its own — the media
+// indicator is driven by stream presence, not by a timer.
+const CONNECT_TIMEOUT_MS = 60000;
+const RECONNECT_GRACE_MS = 20000;
+
+type CallState =
+  | "idle"
+  | "signaling"
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "ended"
+  | "failed"
+  | "cancelled";
+
 function ChatRoomContent() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
@@ -60,10 +79,20 @@ function ChatRoomContent() {
   const answerReceivedRef = useRef(false);
   const typingSentAtRef = useRef(0);
   const typingClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const disconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { reactionsRef, addReaction } = useReactions();
   const [overlayReactions, setOverlayReactions] = useState<{ id: string; icon: import("@/components/icons/icons").IconName }[]>([]);
   const containerRef = useRef<HTMLDivElement>(null);
+  const [callState, setCallState] = useState<CallState>("idle");
+  const callStateRef = useRef<CallState>("idle");
+  const isOffererRef = useRef(false);
+  const startOfferLoopRef = useRef<(() => void) | null>(null);
+
+  const setCallStateSafe = useCallback((s: CallState) => {
+    callStateRef.current = s;
+    setCallState(s);
+    console.log("[PeerTalks][SESSION] state", { sessionId: id, callState: s });
+  }, [id]);
 
   useEffect(() => {
     createClient().then(async (client) => {
@@ -112,6 +141,7 @@ function ChatRoomContent() {
           const { userId: fromId } = payload.payload as { userId: string };
           if (fromId === userIdRef.current) return;
           if (peerIdRef.current && fromId !== peerIdRef.current) return;
+          setCallStateSafe("ended");
           setPeerLeft(true);
         })
         .subscribe();
@@ -169,7 +199,7 @@ function ChatRoomContent() {
     };
     loadSession();
     return () => { cancelled = true; };
-  }, [id, clientReady, router, toast]);
+  }, [id, clientReady, router, toast, setCallStateSafe]);
 
   // Live session state: guest assignment on private rooms (peer id becomes
   // known late) and the peer ending the session. Without this the host
@@ -203,6 +233,7 @@ function ChatRoomContent() {
               if (sessionEndedRef.current) return;
               sessionEndedRef.current = true;
               console.log("[PeerTalks][SESSION] peer ended session", { sessionId: id });
+              setCallStateSafe("ended");
               setPeerLeftReason("Your partner ended the chat");
               setPeerLeft(true);
               return;
@@ -241,7 +272,7 @@ function ChatRoomContent() {
         sessionChannelRef.current = null;
       }
     };
-  }, [id, callLoaded]);
+  }, [id, callLoaded, setCallStateSafe]);
 
   // Message history + realtime
   useEffect(() => {
@@ -455,9 +486,9 @@ function ChatRoomContent() {
         clearTimeout(typingClearTimerRef.current);
         typingClearTimerRef.current = null;
       }
-      if (disconnectTimerRef.current) {
-        clearTimeout(disconnectTimerRef.current);
-        disconnectTimerRef.current = null;
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
       }
       stopLocalStream(localStreamRef.current);
       setRemoteStream((prev) => {
@@ -487,10 +518,11 @@ function ChatRoomContent() {
   }, [callType, joined]);
 
   const handlePeerLeft = useCallback(() => {
-    // Stop the offer retry loop and the connect timer immediately: after a
-    // peer-left the loop would otherwise keep broadcasting offers (and the
-    // 45s connect timer would later overwrite the accurate "partner left"
-    // reason with a misleading "couldn't be reached" message).
+    // Stop the offer retry loop and the connect/reconnect timers
+    // immediately: after a peer-left the loop would otherwise keep
+    // broadcasting offers (and the 60s connect timer would later overwrite
+    // the accurate "partner left" reason with a misleading "couldn't be
+    // reached" message).
     if (offerTimerRef.current) {
       clearInterval(offerTimerRef.current);
       offerTimerRef.current = null;
@@ -499,8 +531,65 @@ function ChatRoomContent() {
       clearTimeout(connectTimerRef.current);
       connectTimerRef.current = null;
     }
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    if (!sessionEndedRef.current) {
+      setCallStateSafe("ended");
+    }
     setPeerLeft(true);
-  }, []);
+  }, [setCallStateSafe]);
+
+  // The peer connection dropping (disconnected/failed) does NOT prove the
+  // peer left — on mobile a short network blip, backgrounding or a slow
+  // phone looks identical. Enter a reconnecting state: attempt recovery and
+  // only surface "Conversation ended" after the grace period expires with no
+  // recovery and no authoritative departure evidence.
+  const enterReconnecting = useCallback(() => {
+    const pc = pcRef.current;
+    if (!pc || pc.connectionState === "closed" || sessionEndedRef.current) return;
+    if (callStateRef.current === "ended" || callStateRef.current === "reconnecting") return;
+    console.log("[PeerTalks][SESSION] connection lost - reconnecting", {
+      connectionState: pc.connectionState,
+      iceConnectionState: pc.iceConnectionState,
+    });
+    setCallStateSafe("reconnecting");
+    // Restart ICE (triggers negotiationneeded) and, on the offerer side,
+    // resume the offer retry loop so the recovery offer is actually sent.
+    try {
+      pc.restartIce();
+    } catch {}
+    answerReceivedRef.current = false;
+    if (isOffererRef.current) {
+      startOfferLoopRef.current?.();
+    }
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    reconnectTimerRef.current = setTimeout(() => {
+      reconnectTimerRef.current = null;
+      const cur = pcRef.current;
+      if (!cur || cur.connectionState === "closed" || sessionEndedRef.current) return;
+      const down =
+        cur.connectionState === "disconnected" ||
+        cur.connectionState === "failed" ||
+        cur.iceConnectionState === "disconnected" ||
+        cur.iceConnectionState === "failed";
+      if (down) {
+        console.log("[PeerTalks][TIMEOUT] reconnect grace expired", {
+          connectionState: cur.connectionState,
+          iceConnectionState: cur.iceConnectionState,
+        });
+        setPeerLeftReason("The connection to your partner was lost");
+        handlePeerLeft();
+      } else {
+        console.log("[PeerTalks][SESSION] reconnected");
+        setCallStateSafe("connected");
+      }
+    }, RECONNECT_GRACE_MS);
+  }, [handlePeerLeft, setCallStateSafe]);
 
   const initiateSignaling = useCallback(async (pc: RTCPeerConnection, isOfferer: boolean) => {
     const supabase = getSupabase();
@@ -622,6 +711,30 @@ function ChatRoomContent() {
     }
     signalingChannelRef.current = channel;
 
+    // Recovery path: when restartIce() (or a transceiver change) flags that
+    // the connection needs renegotiation, this handler actually broadcasts
+    // the new offer. Without it a restarted ICE never leaves this client and
+    // the call stays stuck in "disconnected" until the grace timer kills it.
+    // Gated to the reconnecting phase so it never duplicates the offerer's
+    // initial offer loop.
+    pc.onnegotiationneeded = async () => {
+      if (sessionEndedRef.current || pc.connectionState === "closed") return;
+      if (callStateRef.current !== "reconnecting") return;
+      if (pc.signalingState !== "stable") return;
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await channel.send({
+          type: "broadcast",
+          event: "signal",
+          payload: { type: "offer", sdp: offer.sdp!, senderId: userIdRef.current },
+        });
+        console.log("[PeerTalks][SIGNALING] recovery offer sent", { signalingState: pc.signalingState });
+      } catch (e) {
+        console.error("[PeerTalks][SIGNALING] recovery offer failed", e);
+      }
+    };
+
     if (isOfferer) {
       // Retry the offer until we get an answer (handles peers joining late).
       // The FIRST offer is often broadcast before the peer's channel is
@@ -660,7 +773,12 @@ function ChatRoomContent() {
 
       await new Promise((r) => setTimeout(r, 800));
       await sendOffer();
-      offerTimerRef.current = setInterval(sendOffer, 2500);
+      // Exposed so the reconnecting path can resume offering after a drop.
+      startOfferLoopRef.current = () => {
+        if (offerTimerRef.current) return;
+        offerTimerRef.current = setInterval(sendOffer, 2500);
+      };
+      startOfferLoopRef.current();
     }
   }, [id, addReaction, reactionsRef, handlePeerLeft]);
 
@@ -707,27 +825,56 @@ function ChatRoomContent() {
           streams: event.streams.length,
           hasStream: !!event.streams[0],
         });
-        if (event.streams && event.streams[0]) {
-          remoteStream = event.streams[0];
+        // Build ONE stable remote stream and merge every incoming track into
+        // it. Browsers differ wildly here: some give a full stream on the
+        // first event, some an empty streams array, some separate streams per
+        // track, and renegotiation re-fires ontrack. Never replace a valid
+        // stream with null, never drop a track.
+        const incoming = event.streams && event.streams[0] ? event.streams[0] : null;
+        if (incoming && !remoteStream) {
+          remoteStream = incoming;
           setRemoteStream(remoteStream);
-        } else if (event.track) {
-          if (!remoteStream) {
-            remoteStream = new MediaStream([event.track]);
+          console.log("[PeerTalks][MEDIA] remote stream established", {
+            streamId: incoming.id,
+            videoTracks: incoming.getVideoTracks().length,
+            audioTracks: incoming.getAudioTracks().length,
+          });
+        } else if (incoming && remoteStream) {
+          const track = event.track;
+          const alreadyAdded = remoteStream
+            .getTracks()
+            .some((t) => t.id === (track?.id ?? ""));
+          if (track && !alreadyAdded) {
+            remoteStream.addTrack(track);
             setRemoteStream(remoteStream);
-          } else {
-            const alreadyAdded = remoteStream
-              .getTracks()
-              .some((t) => t.id === event.track?.id);
-            if (!alreadyAdded) {
-              remoteStream.addTrack(event.track);
-            }
+            console.log("[PeerTalks][MEDIA] merged remote track", {
+              trackKind: track.kind,
+              streamId: remoteStream.id,
+            });
+          }
+        } else if (event.track && !remoteStream) {
+          remoteStream = new MediaStream([event.track]);
+          setRemoteStream(remoteStream);
+          console.log("[PeerTalks][MEDIA] remote stream built from track", {
+            trackKind: event.track.kind,
+            streamId: remoteStream.id,
+          });
+        } else if (event.track && remoteStream) {
+          const alreadyAdded = remoteStream
+            .getTracks()
+            .some((t) => t.id === event.track?.id);
+          if (!alreadyAdded) {
+            remoteStream.addTrack(event.track);
             setRemoteStream(remoteStream);
+            console.log("[PeerTalks][MEDIA] merged remote track (no stream)", {
+              trackKind: event.track.kind,
+            });
           }
         }
       };
 
       pc.oniceconnectionstatechange = () => {
-        console.log("[PeerTalks][WEBRTC] iceConnectionState:", pc.iceConnectionState);
+        console.log("[PeerTalks][ICE] iceConnectionState:", pc.iceConnectionState);
         if (pc.iceConnectionState === "disconnected") {
           // Try to re-establish
           try {
@@ -735,12 +882,17 @@ function ChatRoomContent() {
           } catch {}
         }
       };
+      pc.onicegatheringstatechange = () => {
+        console.log("[PeerTalks][ICE] iceGatheringState:", pc.iceGatheringState);
+      };
 
       pc.onconnectionstatechange = () => {
-        setConnectionState(pc.connectionState);
-        console.log("[PeerTalks][WEBRTC] connectionState:", pc.connectionState);
-        if (pc.connectionState === "connected") {
+        const st = pc.connectionState;
+        setConnectionState(st);
+        console.log("[PeerTalks][WEBRTC] connectionState:", st);
+        if (st === "connected") {
           setPeerLeft(false);
+          setCallStateSafe("connected");
           if (offerTimerRef.current) {
             clearInterval(offerTimerRef.current);
             offerTimerRef.current = null;
@@ -749,23 +901,21 @@ function ChatRoomContent() {
             clearTimeout(connectTimerRef.current);
             connectTimerRef.current = null;
           }
-        } else if (pc.connectionState === "failed") {
-          setPeerLeftReason("The connection to your partner was lost");
-          if (offerTimerRef.current) {
-            clearInterval(offerTimerRef.current);
-            offerTimerRef.current = null;
+          if (reconnectTimerRef.current) {
+            clearTimeout(reconnectTimerRef.current);
+            reconnectTimerRef.current = null;
           }
-          handlePeerLeft();
-        } else if (pc.connectionState === "disconnected") {
-          // Give ICE restart a chance before declaring peer left
-          disconnectTimerRef.current = setTimeout(() => {
-            disconnectTimerRef.current = null;
-            if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
-              setPeerLeftReason("The connection to your partner was lost");
-              handlePeerLeft();
-            }
-          }, 6000);
+        } else if (st === "connecting") {
+          if (callStateRef.current === "signaling") {
+            setCallStateSafe("connecting");
+          }
+        } else if (st === "disconnected" || st === "failed") {
+          // Transient on mobile — go through the recovery grace period
+          // before ever declaring the conversation ended.
+          enterReconnecting();
         }
+        // "connecting"/"new" keep the call alive; delayed media is handled
+        // by the media-waiting indicator, never by ending the session.
       };
 
       const tracks = stream.getTracks();
@@ -789,21 +939,31 @@ function ChatRoomContent() {
       // unknown at join time (private rooms).
       const isOfferer = (session?.data?.user1_id ?? null) === userIdRef.current;
       console.log("[PeerTalks][WEBRTC] role determined", { isOfferer, sessionId: id });
+      isOffererRef.current = isOfferer;
 
       initiateSignaling(pc, isOfferer);
+      setCallStateSafe("signaling");
 
       // If the peer never joins (e.g. the other user closed the tab), never
-      // stay on "Establishing secure connection..." forever.
+      // stay on "Establishing secure connection..." forever. This is the ONLY
+      // timer that can end the conversation before a connection exists, and
+      // it deliberately does NOT fire while reconnecting or once media has
+      // arrived — delayed media is never treated as a departure.
       connectTimerRef.current = setTimeout(() => {
+        const cur = pcRef.current;
         if (
-          pcRef.current &&
-          pcRef.current.connectionState !== "connected" &&
+          cur &&
+          cur.connectionState !== "connected" &&
+          callStateRef.current !== "reconnecting" &&
           !sessionEndedRef.current
         ) {
+          console.log("[PeerTalks][TIMEOUT] connect timeout - peer never connected", {
+            connectionState: cur.connectionState,
+          });
           setPeerLeftReason("Your partner couldn't be reached. They may have left or lost connection.");
           setPeerLeft(true);
         }
-      }, 45000);
+      }, CONNECT_TIMEOUT_MS);
     } catch (joinError) {
       // Any exception in PC setup / track add / session fetch must be
       // visible to the user, not an unhandled rejection with a half-built
@@ -825,7 +985,7 @@ function ChatRoomContent() {
     } finally {
       setIsJoining(false);
     }
-  }, [callType, id, initiateSignaling, handlePeerLeft]);
+  }, [callType, id, initiateSignaling, enterReconnecting, setCallStateSafe]);
 
   const cleanupChannels = useCallback(() => {
     const supabase = getSupabase();
@@ -859,9 +1019,9 @@ function ChatRoomContent() {
       clearTimeout(typingClearTimerRef.current);
       typingClearTimerRef.current = null;
     }
-    if (disconnectTimerRef.current) {
-      clearTimeout(disconnectTimerRef.current);
-      disconnectTimerRef.current = null;
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
     }
   }, []);
 
@@ -896,6 +1056,7 @@ function ChatRoomContent() {
 
   const endChat = useCallback(async (goTo: string = "/dashboard") => {
     sessionEndedRef.current = true;
+    setCallStateSafe("ended");
     if (signalingChannelRef.current) {
       signalingChannelRef.current.send({
         type: "broadcast",
@@ -916,7 +1077,7 @@ function ChatRoomContent() {
     });
     purgeQueueRows();
     router.push(goTo);
-  }, [router, cleanupChannels, purgeQueueRows, endSessionOnServer]);
+  }, [router, cleanupChannels, purgeQueueRows, endSessionOnServer, setCallStateSafe]);
 
   // Leaving the page without pressing "End chat" (back button, tab close)
   // must still end the session and purge matching rows — otherwise a stale
@@ -1257,9 +1418,23 @@ function ChatRoomContent() {
           <VideoCard
             stream={remoteStream}
             connectionState={connectionState}
-            isLoading={connectionState === "connecting"}
+            isLoading={connectionState === "connecting" || callState === "signaling"}
+            statusText={
+              callState === "reconnecting"
+                ? "Reconnecting…"
+                : connectionState === "connected" && !remoteStream
+                ? "Waiting for their video…"
+                : undefined
+            }
           />
           <ReactionOverlay reactions={overlayReactions} />
+          {callState === "reconnecting" && (
+            <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 pointer-events-none">
+              <span className="text-[11px] uppercase tracking-wider font-medium px-3 py-1.5 rounded-full bg-warning-soft text-warning border border-warning/20">
+                Reconnecting…
+              </span>
+            </div>
+          )}
           <FloatingPreview
             stream={localStream}
             audioEnabled={audioEnabled}

@@ -9,6 +9,7 @@ interface VideoCardProps {
   label?: string;
   isLoading?: boolean;
   connectionState?: string;
+  statusText?: string;
 }
 
 export function VideoCard({
@@ -18,6 +19,7 @@ export function VideoCard({
   label,
   isLoading,
   connectionState,
+  statusText,
 }: VideoCardProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
@@ -94,7 +96,7 @@ export function VideoCard({
             </div>
           </div>
           <p className="text-white/25 text-sm font-light">
-            {isLoading ? "Establishing secure connection..." : "Waiting for peer..."}
+            {statusText ?? (isLoading ? "Establishing secure connection..." : "Waiting for peer...")}
           </p>
           {isLoading && (
             <div className="mt-5 flex justify-center gap-2">
