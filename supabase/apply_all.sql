@@ -882,6 +882,8 @@ $$;
 --      dependency from room join. Verifies the bcrypt password inside
 --      Postgres (pgcrypto crypt) and NEVER returns password_hash.
 -- ----------------------------------------------------------------------------
+create extension if not exists pgcrypto;
+
 create or replace function public.lookup_private_room(
   p_name text,
   p_password text
@@ -892,6 +894,7 @@ set search_path = ''
 as $$
 declare
   v_row    record;
+  v_hash   text;
   v_valid  boolean;
 begin
   if p_name is null or p_name = '' or p_password is null
@@ -909,10 +912,15 @@ begin
     return null;
   end if;
 
+  v_hash := replace(replace(v_row.password_hash, '$2b$', '$2a$'), '$2y$', '$2a$');
+
   begin
-    v_valid := extensions.crypt(p_password, v_row.password_hash) = v_row.password_hash;
-  exception when others then
-    v_valid := false;
+    v_valid := extensions.crypt(p_password, v_hash) = v_hash;
+  exception
+    when undefined_function then
+      v_valid := public.crypt(p_password, v_hash) = v_hash;
+    when others then
+      v_valid := false;
   end;
 
   return jsonb_build_object(
