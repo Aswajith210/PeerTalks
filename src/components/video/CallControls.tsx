@@ -91,8 +91,8 @@ export function CallControls({
     const onTouch = () => resetTimer();
 
     resetTimer();
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("touchstart", onTouch);
+    window.addEventListener("mousemove", onMove, { passive: true });
+    window.addEventListener("touchstart", onTouch, { passive: true });
 
     return () => {
       if (hideTimeout.current) clearTimeout(hideTimeout.current);
@@ -105,9 +105,14 @@ export function CallControls({
     <div
       className={`fixed bottom-0 left-0 right-0 flex items-center justify-center pb-6 sm:pb-8 pointer-events-none z-40 transition-all duration-500 ${
         visible ? "translate-y-0 opacity-100" : "translate-y-8 opacity-0"
+      } ${
+        showChat
+          ? "opacity-0 pointer-events-none sm:opacity-100 sm:pointer-events-auto"
+          : ""
       }`}
+      style={{ paddingBottom: "calc(1.5rem + env(safe-area-inset-bottom))" }}
     >
-      <div className="glass-strong rounded-2xl px-3 sm:px-4 py-3 flex items-center gap-2 sm:gap-3 pointer-events-auto shadow-glass-lg border-white/[0.06]">
+      <div className="glass-strong rounded-2xl px-3 sm:px-4 py-3 flex items-center gap-2 sm:gap-3 pointer-events-auto shadow-glass-lg border-white/[0.06] call-controls-bar">
         <ControlButton
           active={audioEnabled}
           onClick={onToggleAudio}

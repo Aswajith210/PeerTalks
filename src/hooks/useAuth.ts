@@ -20,9 +20,17 @@ export function useAuth() {
         return;
       }
 
-      const { data: { session } } = await supabase.auth.getSession();
+      // getUser() validates the JWT against the auth server (refreshing it
+      // if needed) so an expired/revoked cookie session is never shown as
+      // authenticated — getSession() alone would trust the local cookie.
+      const { data: { user }, error } = await supabase.auth.getUser();
+      let resolved = user ?? null;
+      if (error) {
+        const { data: { session } } = await supabase.auth.getSession();
+        resolved = session?.user ?? null;
+      }
       if (mounted) {
-        setUser(session?.user ?? null);
+        setUser(resolved);
         setLoading(false);
       }
 

@@ -2,7 +2,7 @@
 
 import { Canvas } from "@react-three/fiber";
 import { Environment, Float, MeshTransmissionMaterial, Sphere, Torus } from "@react-three/drei";
-import { Suspense, useMemo } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import * as THREE from "three";
 
 function FloatingObjects() {
@@ -135,6 +135,21 @@ function Lighting() {
 }
 
 export function HeroScene() {
+  const [enabled, setEnabled] = useState(false);
+
+  useEffect(() => {
+    // MeshTransmissionMaterial ×4 + a continuous render loop is far too
+    // heavy for phones; on small screens or reduced-motion the hero falls
+    // back to the pure-CSS premium background. One frame late so the first
+    // paint is always the null state (no SSR hydration flash).
+    const fine = window.matchMedia("(min-width: 768px)").matches;
+    const noReducedMotion = !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const raf = requestAnimationFrame(() => setEnabled(fine && noReducedMotion));
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  if (!enabled) return null;
+
   return (
     <div className="absolute inset-0 w-full h-screen overflow-hidden">
       <Canvas camera={{ position: [0, 0, 6], fov: 40 }} dpr={[1, 2]} className="pointer-events-none">

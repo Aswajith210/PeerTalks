@@ -149,6 +149,11 @@ export function TokensProvider({ children }: { children: React.ReactNode }) {
           return;
         }
 
+        // Account switch (another user signed in without a reload): clear the
+        // previous account's balance immediately so it is never shown while
+        // the new account's balance is still loading.
+        setState({ balance: 0, loading: true, error: null });
+
         await syncBalance();
         if (gen !== wireGenRef.current || !mounted) return;
 

@@ -2,6 +2,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
+import { MotionConfig } from "framer-motion";
 import { Toaster } from "@/components/ui/Toast";
 import { KeyboardShortcuts } from "@/components/ui/KeyboardShortcuts";
 import { TokensProvider } from "@/hooks/useTokens";
@@ -22,9 +23,11 @@ export function Providers({ children }: { children: React.ReactNode }) {
   return (
     <QueryClientProvider client={queryClient}>
       <TokensProvider>
-        {children}
-        <Toaster />
-        <KeyboardShortcuts />
+        <MotionConfig reducedMotion="user">
+          {children}
+          <Toaster />
+          <KeyboardShortcuts />
+        </MotionConfig>
       </TokensProvider>
     </QueryClientProvider>
   );

@@ -18,17 +18,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  // The room lookup MUST use the service-role client: private_rooms RLS only
-  // lets host/guest SELECT rows, so a prospective guest (guest_id is still
-  // null) would get zero rows and this route would 404 before ever checking
-  // the password. The anon client stays for everything user-scoped.
-  let admin;
-  try {
-    admin = createAdminClient();
-  } catch {
-    return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
-  }
-
   const requestKey = parseRequestKey(request);
   if (!requestKey) {
     return NextResponse.json({ error: "Missing or invalid idempotency key" }, { status: 400 });
@@ -46,12 +35,36 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Invalid call type" }, { status: 400 });
   }
 
-  const { data: roomRow } = await admin
-    .from("private_rooms")
-    .select("id, name, password_hash, host_id, guest_id, is_active, created_at, ended_at")
-    .eq("name", name)
-    .eq("is_active", true)
-    .single();
+  // Room lookup via SECURITY DEFINER RPC: private_rooms RLS only lets
+  // host/guest SELECT rows, so a prospective guest (guest_id still null)
+  // sees zero rows with the authenticated client — exactly the reason this
+  // used to need the service-role key. The RPC does the same cross-user
+  // lookup under definer rights, so the user session suffices.
+  let { data: roomRow, error: lookupError } = await supabase.rpc("lookup_private_room", {
+    p_name: name,
+  });
+
+  // RPC not deployed (PGRST202) — fall back to the service-role lookup.
+  if (lookupError?.code === "PGRST202") {
+    let admin;
+    try {
+      admin = createAdminClient();
+    } catch {
+      return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
+    }
+    const lookup = await admin
+      .from("private_rooms")
+      .select("id, name, password_hash, host_id, guest_id, is_active, created_at, ended_at")
+      .eq("name", name)
+      .eq("is_active", true)
+      .single();
+    roomRow = lookup.data ?? null;
+    lookupError = lookup.error;
+  }
+
+  if (lookupError && lookupError.code !== "PGRST202") {
+    return NextResponse.json({ error: "Failed to look up room" }, { status: 500 });
+  }
 
   // Never expose password_hash to the client — strip it before any return.
   const room = roomRow
@@ -150,16 +163,40 @@ export async function POST(request: Request) {
 
   // Fallback: direct update (service-role client — the guest update and the
   // session writes below are RLS-restricted to the host/participants).
-  const { error: updateError } = await admin
+  // The `.is("guest_id", null)` guard makes the update a CAS: two
+  // concurrent guests racing here — both passed the pre-checks — can only
+  // have ONE of them match a row. Select the row back so the loser is
+  // detected instead of silently creating a second session (room capacity
+  // is exactly one guest). Only runs when the RPCs above are missing
+  // (PGRST202); needs the server-side service-role key.
+  let admin;
+  try {
+    admin = createAdminClient();
+  } catch {
+    await refundCharge();
+    return NextResponse.json(
+      { error: "Server configuration error" },
+      { status: 500 }
+    );
+  }
+
+  const { data: assigned, error: updateError } = await admin
     .from("private_rooms")
     .update({ guest_id: session.user.id })
     .eq("id", room.id)
     .eq("is_active", true)
-    .is("guest_id", null);
+    .is("guest_id", null)
+    .select("id")
+    .maybeSingle();
 
   if (updateError) {
     await refundCharge();
     return NextResponse.json({ error: "Failed to join room" }, { status: 500 });
+  }
+  if (!assigned) {
+    // Another guest won the race — the room is full for this request.
+    await refundCharge();
+    return NextResponse.json({ error: "Room is full" }, { status: 400 });
   }
 
   // Find or create chat session

@@ -27,6 +27,7 @@ export function Dialog({ open, onClose, children, className = "" }: DialogProps)
       {open && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
           <motion.div
+            ref={overlayRef}
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
@@ -35,7 +36,6 @@ export function Dialog({ open, onClose, children, className = "" }: DialogProps)
             onClick={(e) => { if (e.target === overlayRef.current) onClose(); }}
           />
           <motion.div
-            ref={overlayRef}
             initial={{ opacity: 0, scale: 0.95, y: 10 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.95, y: 10 }}

@@ -1,6 +1,7 @@
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
+import { TOKEN_ALLOWANCE } from "@/lib/constants";
 
 export const dynamic = "force-dynamic";
 
@@ -133,12 +134,12 @@ export async function GET(request: Request) {
   if (!balance) {
     await supabase.from("token_balances").insert({
       user_id: session.user.id,
-      balance: 20,
+      balance: TOKEN_ALLOWANCE.AMOUNT,
       last_daily_at: new Date().toISOString(),
     });
     await supabase.from("token_transactions").insert({
       user_id: session.user.id,
-      amount: 20,
+      amount: TOKEN_ALLOWANCE.AMOUNT,
       type: "daily_allowance",
       description: "Welcome bonus",
     });

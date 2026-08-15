@@ -108,19 +108,29 @@ export function PremiumBackground() {
     const spotlight = spotlightRef.current;
     if (!spotlight) return;
 
+    // rAF-coalesce: writing the gradient style on every mousemove triggers
+    // layout+repaint each event; one paint per frame is enough.
+    let raf = 0;
     const handleMouseMove = (e: MouseEvent) => {
-      const x = (e.clientX / window.innerWidth) * 100;
-      const y = (e.clientY / window.innerHeight) * 100;
-      spotlight.style.background = `radial-gradient(
-        600px circle at ${x}% ${y}%,
-        rgba(255, 255, 255, 0.015) 0%,
-        transparent 70%
-      )`;
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        const x = (e.clientX / window.innerWidth) * 100;
+        const y = (e.clientY / window.innerHeight) * 100;
+        spotlight.style.background = `radial-gradient(
+          600px circle at ${x}% ${y}%,
+          rgba(255, 255, 255, 0.015) 0%,
+          transparent 70%
+        )`;
+      });
     };
 
     window.addEventListener("mousemove", handleMouseMove, { passive: true });
 
-    return () => window.removeEventListener("mousemove", handleMouseMove);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      if (raf) cancelAnimationFrame(raf);
+    };
   }, []);
 
   return (

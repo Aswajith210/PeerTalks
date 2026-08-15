@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useRouter } from "next/navigation";
 
@@ -26,12 +26,14 @@ export function KeyboardShortcuts() {
     [router]
   );
 
+  const gHandlerRef = useRef<((e2: KeyboardEvent) => void) | null>(null);
+
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
       if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable) return;
 
-      if (e.key === "?" && !e.shiftKey) {
+      if (e.key === "?" && !e.ctrlKey && !e.metaKey && !e.altKey) {
         setOpen((prev) => !prev);
         return;
       }
@@ -43,16 +45,21 @@ export function KeyboardShortcuts() {
 
       if (e.key === "g" && open) return;
 
-      if (e.key === "g") {
+      if (e.key === "g" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (gHandlerRef.current) {
+          window.removeEventListener("keydown", gHandlerRef.current);
+        }
         const handler = (e2: KeyboardEvent) => {
+          gHandlerRef.current = null;
+          window.removeEventListener("keydown", handler);
           const key = e2.key.toLowerCase();
           const shortcut = shortcuts.find((s) => s.key === `g ${key}`);
           if (shortcut?.action) {
             shortcut.action();
             setOpen(false);
           }
-          window.removeEventListener("keydown", handler);
         };
+        gHandlerRef.current = handler;
         window.addEventListener("keydown", handler);
       }
     },
@@ -61,7 +68,13 @@ export function KeyboardShortcuts() {
 
   useEffect(() => {
     window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      if (gHandlerRef.current) {
+        window.removeEventListener("keydown", gHandlerRef.current);
+        gHandlerRef.current = null;
+      }
+    };
   }, [handleKeyDown]);
 
   return (

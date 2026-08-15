@@ -60,6 +60,7 @@ function ChatRoomContent() {
   const answerReceivedRef = useRef(false);
   const typingSentAtRef = useRef(0);
   const typingClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const disconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { reactionsRef, addReaction } = useReactions();
   const [overlayReactions, setOverlayReactions] = useState<{ id: string; icon: import("@/components/icons/icons").IconName }[]>([]);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -102,6 +103,7 @@ function ChatRoomContent() {
         .on("broadcast", { event: "typing" }, (payload) => {
           const { userId: fromId } = payload.payload as { userId: string };
           if (fromId === userIdRef.current) return;
+          if (peerIdRef.current && fromId !== peerIdRef.current) return;
           setPeerTyping(true);
           if (typingClearTimerRef.current) clearTimeout(typingClearTimerRef.current);
           typingClearTimerRef.current = setTimeout(() => setPeerTyping(false), 2500);
@@ -109,6 +111,7 @@ function ChatRoomContent() {
         .on("broadcast", { event: "peerleft" }, (payload) => {
           const { userId: fromId } = payload.payload as { userId: string };
           if (fromId === userIdRef.current) return;
+          if (peerIdRef.current && fromId !== peerIdRef.current) return;
           setPeerLeft(true);
         })
         .subscribe();
@@ -131,6 +134,16 @@ function ChatRoomContent() {
         .maybeSingle();
       if (!cancelled) {
         if (data) {
+          // A session that is already ended (or whose room host never got a
+          // guest and is gone) must not leave the user stranded on the
+          // JoinScreen forever — surface it and get them back to the
+          // dashboard immediately.
+          if (data.status === "ended") {
+            toast.error("This conversation has ended");
+            router.replace("/dashboard");
+            setCallLoaded(true);
+            return;
+          }
           setCallType(data.call_type ?? "video");
           const myId = userIdRef.current;
           if (myId) {
@@ -283,10 +296,21 @@ function ChatRoomContent() {
             filter: `session_id=eq.${id}`,
           },
           (payload) => {
-            setMessages((prev) => [...prev, payload.new as Message]);
+            const incoming = payload.new as Message;
+            // Dedupe by id: an optimistically-appended sent message and the
+            // realtime event for the same row must not appear twice.
+            setMessages((prev) =>
+              prev.some((m) => m.id === incoming.id)
+                ? prev.map((m) => (m.id === incoming.id ? incoming : m))
+                : [...prev, incoming]
+            );
           }
         )
-        .subscribe();
+        .subscribe((status) => {
+          if (status === "CHANNEL_ERROR" && !cancelled) {
+            toast.error("Live message updates failed", "Refresh the page to see new messages");
+          }
+        });
 
       // Peer reactions only ever appeared after a reload — subscribe to
       // message_reactions so both clients stay in sync live. No table
@@ -363,7 +387,7 @@ function ChatRoomContent() {
         reactionsChannelRef.current = null;
       }
     };
-  }, [id, joined]);
+  }, [id, joined, toast]);
 
   // Local media
   useEffect(() => {
@@ -371,7 +395,9 @@ function ChatRoomContent() {
 
     const startMedia = async () => {
       try {
-        const stream = await startLocalStream({ video: true, audio: true });
+        // startLocalStream() defaults carry the 720p caps — unconstrained
+        // getUserMedia would pick the camera's maximum (4K on phones).
+        const stream = await startLocalStream();
         if (!cancelled) {
           setLocalStream(stream);
           localStreamRef.current = stream;
@@ -423,6 +449,10 @@ function ChatRoomContent() {
         clearTimeout(typingClearTimerRef.current);
         typingClearTimerRef.current = null;
       }
+      if (disconnectTimerRef.current) {
+        clearTimeout(disconnectTimerRef.current);
+        disconnectTimerRef.current = null;
+      }
       stopLocalStream(localStreamRef.current);
       setRemoteStream((prev) => {
         prev?.getTracks().forEach((t) => t.stop());
@@ -439,15 +469,30 @@ function ChatRoomContent() {
   useEffect(() => {
     if (callType === "video" && joined) {
       document.body.dataset.peertalksInChat = "1";
+      document.body.dataset.peertalksInCall = "1";
     } else {
       delete document.body.dataset.peertalksInChat;
+      delete document.body.dataset.peertalksInCall;
     }
     return () => {
       delete document.body.dataset.peertalksInChat;
+      delete document.body.dataset.peertalksInCall;
     };
   }, [callType, joined]);
 
   const handlePeerLeft = useCallback(() => {
+    // Stop the offer retry loop and the connect timer immediately: after a
+    // peer-left the loop would otherwise keep broadcasting offers (and the
+    // 45s connect timer would later overwrite the accurate "partner left"
+    // reason with a misleading "couldn't be reached" message).
+    if (offerTimerRef.current) {
+      clearInterval(offerTimerRef.current);
+      offerTimerRef.current = null;
+    }
+    if (connectTimerRef.current) {
+      clearTimeout(connectTimerRef.current);
+      connectTimerRef.current = null;
+    }
     setPeerLeft(true);
   }, []);
 
@@ -464,19 +509,23 @@ function ChatRoomContent() {
     const channel = supabase.channel(channelName);
 
     channel.on("broadcast", { event: "reaction" }, (payload) => {
-      const { type } = payload.payload as { type: string };
-      if (type) {
-        addReaction(type);
+      const { type, senderId } = payload.payload as { type: string; senderId?: string };
+      if (!type) return;
+      // Realtime broadcast channels are NOT RLS-filtered — anyone with the
+      // session id can subscribe. Only accept events from the actual peer.
+      if (senderId && peerIdRef.current && senderId !== peerIdRef.current) return;
+      addReaction(type);
+      setOverlayReactions([...reactionsRef.current]);
+      setTimeout(() => {
         setOverlayReactions([...reactionsRef.current]);
-        setTimeout(() => {
-          setOverlayReactions([...reactionsRef.current]);
-        }, 100);
-      }
+      }, 100);
     });
 
     channel.on("broadcast", { event: "typing" }, (payload) => {
       const { userId: fromId } = payload.payload as { userId: string };
       if (fromId === userIdRef.current) return;
+      // Typing is only meaningful when it comes from the actual peer.
+      if (peerIdRef.current && fromId !== peerIdRef.current) return;
       setPeerTyping(true);
       if (typingClearTimerRef.current) clearTimeout(typingClearTimerRef.current);
       typingClearTimerRef.current = setTimeout(() => setPeerTyping(false), 2500);
@@ -485,11 +534,21 @@ function ChatRoomContent() {
     channel.on("broadcast", { event: "peerleft" }, (payload) => {
       const { userId: fromId } = payload.payload as { userId: string };
       if (fromId === userIdRef.current) return;
+      if (peerIdRef.current && fromId !== peerIdRef.current) return;
       handlePeerLeft();
     });
 
     channel.on("broadcast", { event: "signal" }, async (payload) => {
-      const signal = payload.payload as { type: string; sdp?: string; candidate?: RTCIceCandidateInit };
+      const signal = payload.payload as {
+        type: string; sdp?: string; candidate?: RTCIceCandidateInit; senderId?: string;
+      };
+      // Security: signaling channels are public broadcast channels (no RLS).
+      // Never accept offers/answers/ICE from anyone other than the peer —
+      // a stranger with the session id could otherwise inject fake answers,
+      // candidates (IP leak) or kill the call.
+      if (signal.senderId && peerIdRef.current && signal.senderId !== peerIdRef.current) {
+        return;
+      }
       if (signal.type === "offer") {
         console.log("[PeerTalks][WebRTC] offer received");
         try {
@@ -506,7 +565,7 @@ function ChatRoomContent() {
           await channel.send({
             type: "broadcast",
             event: "signal",
-            payload: { type: "answer", sdp: answer.sdp! },
+            payload: { type: "answer", sdp: answer.sdp!, senderId: userIdRef.current },
           });
         } catch (e) {
           console.error("[signaling] Failed to handle offer:", e);
@@ -537,12 +596,18 @@ function ChatRoomContent() {
         channel.send({
           type: "broadcast",
           event: "signal",
-          payload: { type: "ice-candidate", candidate: event.candidate.toJSON() },
+          payload: { type: "ice-candidate", candidate: event.candidate.toJSON(), senderId: userIdRef.current },
         }).catch(() => {});
       }
     };
 
     await channel.subscribe();
+    // The chat may have ended while the channel was connecting — never
+    // register a channel or start the offer loop after cleanup ran.
+    if (sessionEndedRef.current) {
+      supabase.removeChannel(channel);
+      return;
+    }
     signalingChannelRef.current = channel;
 
     if (isOfferer) {
@@ -554,7 +619,7 @@ function ChatRoomContent() {
       const sendOffer = async () => {
         // The chat may have ended while the pre-offer wait was pending —
         // never resurrect the retry loop on a closed/detached peer connection.
-        if (pcRef.current !== pc || pc.connectionState === "closed") return;
+        if (sessionEndedRef.current || pcRef.current !== pc || pc.connectionState === "closed") return;
         if (answerReceivedRef.current || pc.connectionState === "connected") {
           if (offerTimerRef.current) {
             clearInterval(offerTimerRef.current);
@@ -572,7 +637,7 @@ function ChatRoomContent() {
             const ready = await channel.send({
               type: "broadcast",
               event: "signal",
-              payload: { type: "offer", sdp: offer.sdp! },
+              payload: { type: "offer", sdp: offer.sdp!, senderId: userIdRef.current },
             }).then(() => true).catch(() => false);
             console.log("[PeerTalks][WEBRTC] offer sent", { acceptedByRealtime: ready });
           }
@@ -653,7 +718,8 @@ function ChatRoomContent() {
           handlePeerLeft();
         } else if (pc.connectionState === "disconnected") {
           // Give ICE restart a chance before declaring peer left
-          setTimeout(() => {
+          disconnectTimerRef.current = setTimeout(() => {
+            disconnectTimerRef.current = null;
             if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
               setPeerLeftReason("The connection to your partner was lost");
               handlePeerLeft();
@@ -698,6 +764,24 @@ function ChatRoomContent() {
           setPeerLeft(true);
         }
       }, 45000);
+    } catch (joinError) {
+      // Any exception in PC setup / track add / session fetch must be
+      // visible to the user, not an unhandled rejection with a half-built
+      // connection.
+      console.error("[PeerTalks][WEBRTC] join failed", joinError);
+      setMediaError("Could not start the call. Please try again.");
+      if (pcRef.current) {
+        pcRef.current.close();
+        pcRef.current = null;
+      }
+      setRemoteStream((prev) => {
+        prev?.getTracks().forEach((t) => t.stop());
+        return null;
+      });
+      if (connectTimerRef.current) {
+        clearTimeout(connectTimerRef.current);
+        connectTimerRef.current = null;
+      }
     } finally {
       setIsJoining(false);
     }
@@ -735,6 +819,10 @@ function ChatRoomContent() {
       clearTimeout(typingClearTimerRef.current);
       typingClearTimerRef.current = null;
     }
+    if (disconnectTimerRef.current) {
+      clearTimeout(disconnectTimerRef.current);
+      disconnectTimerRef.current = null;
+    }
   }, []);
 
   // Purge this user's matching queue rows (waiting AND matched) for both
@@ -746,6 +834,25 @@ function ChatRoomContent() {
     fetch("/api/matching/random", { method: "DELETE", body, headers: { "Content-Type": "application/json" } }).catch(() => {});
     fetch("/api/matching/interest", { method: "DELETE", body, headers: { "Content-Type": "application/json" } }).catch(() => {});
   }, []);
+
+  // Ends the session server-side with ONE retry. A single failed POST
+  // previously left the DB row "connected" forever (peer stranded, stale
+  // matched queue row resurrecting the dead session) — the unmount path
+  // must not swallow that failure silently. keepalive: true lets the
+  // request finish even if the tab is closing.
+  const endSessionOnServer = useCallback(async () => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await fetch("/api/chat/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: id }),
+          keepalive: true,
+        });
+        if (res.ok) return;
+      } catch {}
+    }
+  }, [id]);
 
   const endChat = useCallback(async (goTo: string = "/dashboard") => {
     sessionEndedRef.current = true;
@@ -759,11 +866,7 @@ function ChatRoomContent() {
     } else {
       cleanupChannels();
     }
-    await fetch("/api/chat/sessions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId: id }),
-    }).catch(() => {});
+    void endSessionOnServer();
     stopLocalStream(localStreamRef.current);
     pcRef.current?.close();
     pcRef.current = null;
@@ -773,7 +876,7 @@ function ChatRoomContent() {
     });
     purgeQueueRows();
     router.push(goTo);
-  }, [id, router, cleanupChannels, purgeQueueRows]);
+  }, [router, cleanupChannels, purgeQueueRows, endSessionOnServer]);
 
   // Leaving the page without pressing "End chat" (back button, tab close)
   // must still end the session and purge matching rows — otherwise a stale
@@ -784,15 +887,11 @@ function ChatRoomContent() {
       if (sessionEndedRef.current) return;
       sessionEndedRef.current = true;
       if (id) {
-        fetch("/api/chat/sessions", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId: id }),
-        }).catch(() => {});
+        void endSessionOnServer();
         purgeQueueRows();
       }
     };
-  }, [id, purgeQueueRows]);
+  }, [id, purgeQueueRows, endSessionOnServer]);
 
   const nextUser = useCallback(() => {
     endChat("/chat/random");
@@ -815,17 +914,30 @@ function ChatRoomContent() {
     if (!s) return;
     const { data: { user } } = await s.auth.getUser();
     if (!user) return;
-    const { error } = await s.from("messages").insert({
-      session_id: id,
-      sender_id: user.id,
-      content,
-    });
+    const { data: inserted, error } = await s
+      .from("messages")
+      .insert({
+        session_id: id,
+        sender_id: user.id,
+        content,
+      })
+      .select()
+      .single();
     if (error) {
       console.error("[PeerTalks][MESSAGES] insert failed", {
         sessionId: id, message: error.message,
       });
       toast.error("Failed to send message");
       setNewMessage(content);
+      return;
+    }
+    // Optimistic append: the sender's bubble must not depend on a realtime
+    // event that may be delayed or broken. The realtime INSERT handler
+    // dedupes by id, so this cannot double-render.
+    if (inserted) {
+      setMessages((prev) =>
+        prev.some((m) => m.id === inserted.id) ? prev : [...prev, inserted]
+      );
     }
   };
 
@@ -862,7 +974,7 @@ function ChatRoomContent() {
       signalingChannelRef.current.send({
         type: "broadcast",
         event: "reaction",
-        payload: { type },
+        payload: { type, senderId: userIdRef.current },
       }).catch(() => {});
     }
   };
@@ -901,7 +1013,10 @@ function ChatRoomContent() {
 
   const submitReport = async () => {
     if (!reportReason.trim()) return;
-    if (!peerIdRef.current) return;
+    if (!peerIdRef.current) {
+      toast.error("Unable to report right now", "Your chat partner is not connected yet.");
+      return;
+    }
     setReportSubmitting(true);
     try {
       const res = await fetch("/api/reports", {
@@ -1122,12 +1237,20 @@ function ChatRoomContent() {
         </div>
 
         {showChat && (
-          <div className="fixed inset-0 z-30 sm:static sm:inset-auto sm:w-80 border-l border-white/5 bg-black/70 flex flex-col sm:relative">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Chat with your partner"
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setShowChat(false);
+            }}
+            className="fixed inset-0 z-40 sm:static sm:inset-auto sm:z-auto sm:w-80 border-l border-white/5 bg-black/70 flex flex-col sm:relative"
+          >
             <div className="flex items-center justify-between p-4 border-b border-white/[0.04]">
               <span className="text-sm text-white/60 font-medium">Chat</span>
               <button
                 onClick={() => setShowChat(false)}
-                className="w-8 h-8 rounded-xl hover:bg-white/[0.04] flex items-center justify-center transition-all duration-200"
+                className="w-11 h-11 rounded-xl hover:bg-white/[0.04] flex items-center justify-center transition-all duration-200"
                 aria-label="Close chat"
               >
                 <Icons.Close size={14} />
@@ -1196,7 +1319,15 @@ function ChatRoomContent() {
       </div>
 
       {peerLeft && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80">
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Conversation ended"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80"
+          onKeyDown={(e) => {
+            if (e.key === "Escape") endChat("/dashboard");
+          }}
+        >
           <div className="glass-card rounded-3xl p-8 text-center max-w-sm mx-4">
             <div className="w-12 h-12 mx-auto rounded-full bg-white/[0.04] border border-white/[0.08] flex items-center justify-center mb-4">
               <svg className="w-6 h-6 text-white/30" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
@@ -1261,7 +1392,7 @@ function MessageBubble({ msg, mine, reactions, onReact }: {
 }) {
   return (
     <div className={`flex flex-col ${mine ? "items-end" : "items-start"}`}>
-      <div className={`max-w-[85%] px-4 py-2.5 rounded-2xl backdrop-blur-xl text-sm text-white/80 ${mine ? "bg-white/15" : "bg-white/10"}`}>
+      <div className={`max-w-[85%] px-4 py-2.5 rounded-2xl text-sm text-white/80 ${mine ? "bg-white/20" : "bg-white/10"}`}>
         {msg.content}
       </div>
       <div className="flex items-center gap-1.5 mt-1">
@@ -1328,7 +1459,15 @@ function ReportDialog({ open, value, onChange, onClose, onSubmit, submitting }: 
     "Other",
   ];
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Report this user"
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4"
+      onKeyDown={(e) => {
+        if (e.key === "Escape") onClose();
+      }}
+    >
       <div className="glass-card rounded-3xl p-6 w-full max-w-sm">
         <h2 className="text-lg font-semibold text-white/90 mb-1">Report this user</h2>
         <p className="text-xs text-muted mb-5">Our team will review this report. Your identity stays anonymous.</p>
@@ -1382,7 +1521,15 @@ function ConfirmDialog({ title, description, onCancel, onConfirm }: {
   onConfirm: () => void;
 }) {
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4"
+      onKeyDown={(e) => {
+        if (e.key === "Escape") onCancel();
+      }}
+    >
       <div className="glass-card rounded-3xl p-6 w-full max-w-sm text-center">
         <h2 className="text-lg font-semibold text-white/90 mb-2">{title}</h2>
         <p className="text-sm text-muted mb-6">{description}</p>

@@ -1,6 +1,9 @@
 import { createServerSupabaseClient } from "@/lib/supabase/server";
 import { NextResponse } from "next/server";
 
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export async function POST(request: Request) {
   const supabase = await createServerSupabaseClient();
   if (!supabase) return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
@@ -12,6 +15,7 @@ export async function POST(request: Request) {
 
   if (!blockedId) return NextResponse.json({ error: "blockedUserId is required" }, { status: 400 });
   if (blockedId === session.user.id) return NextResponse.json({ error: "You cannot block yourself" }, { status: 400 });
+  if (!UUID_RE.test(blockedId)) return NextResponse.json({ error: "Invalid user id" }, { status: 400 });
 
   const { data, error } = await supabase
     .from("blocks")
@@ -36,6 +40,7 @@ export async function DELETE(request: Request) {
   const blockedId = String(body.blockedUserId ?? "");
 
   if (!blockedId) return NextResponse.json({ error: "blockedUserId is required" }, { status: 400 });
+  if (!UUID_RE.test(blockedId)) return NextResponse.json({ error: "Invalid user id" }, { status: 400 });
 
   const { error } = await supabase
     .from("blocks")

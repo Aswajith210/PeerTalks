@@ -56,6 +56,7 @@ export async function middleware(request: NextRequest) {
   const isAuthCallback = pathname.startsWith("/api/auth/callback");
 
   let supabaseResponse = NextResponse.next({ request });
+  let user: Awaited<ReturnType<ReturnType<typeof createServerClient>["auth"]["getUser"]>>["data"]["user"] | null = null;
 
   if (!isAuthCallback) {
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -82,7 +83,19 @@ export async function middleware(request: NextRequest) {
       },
     });
 
-    await supabase.auth.getUser();
+    const { data } = await supabase.auth.getUser();
+    user = data.user;
+
+    // Route protection: pages that require an authenticated session redirect
+    // to /login (validated server-side via the JWT, not the cookie alone).
+    const isProtected =
+      pathname.startsWith("/dashboard") || pathname.startsWith("/chat");
+    if (isProtected && !user) {
+      const loginUrl = request.nextUrl.clone();
+      loginUrl.pathname = "/login";
+      loginUrl.search = "";
+      supabaseResponse = NextResponse.redirect(loginUrl);
+    }
   }
 
   // Apply security headers

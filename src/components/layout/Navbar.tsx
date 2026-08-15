@@ -112,7 +112,7 @@ export function Navbar() {
             )}
           </div>
 
-          <div className="flex items-center gap-2 sm:gap-3">
+          <div className="flex items-center gap-2 sm:gap-3 navbar-cluster">
             {loading ? (
               <div className="w-22 h-9 rounded-xl bg-white/[0.03] animate-pulse" />
             ) : user ? (

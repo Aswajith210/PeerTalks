@@ -11,6 +11,7 @@ interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
 export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
   ({ className = "", variant = "primary", size = "md", loading, children, disabled, ...props }, ref) => {
   const innerRef = useRef<HTMLButtonElement>(null);
+  const moveRaf = useRef<number | null>(null);
     const buttonRef = (ref || innerRef) as React.RefObject<HTMLButtonElement>;
 
     const variants: Record<string, string> = {
@@ -34,13 +35,26 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
 
     const handleMouseMove = (e: React.MouseEvent<HTMLButtonElement>) => {
       if (!buttonRef.current || disabled) return;
-      const rect = buttonRef.current.getBoundingClientRect();
-      const x = (e.clientX - rect.left) / rect.width - 0.5;
-      const y = (e.clientY - rect.top) / rect.height - 0.5;
-      buttonRef.current.style.transform = `translate(${x * 4}px, ${y * 2}px) scale(1.02)`;
+      // Skip on touch devices — the effect is invisible there and
+      // getBoundingClientRect per touch is wasteful.
+      if (typeof window !== "undefined" && !window.matchMedia("(hover: hover)").matches) return;
+      if (moveRaf.current) return;
+      moveRaf.current = window.requestAnimationFrame(() => {
+        moveRaf.current = null;
+        const el = buttonRef.current;
+        if (!el) return;
+        const rect = el.getBoundingClientRect();
+        const x = (e.clientX - rect.left) / rect.width - 0.5;
+        const y = (e.clientY - rect.top) / rect.height - 0.5;
+        el.style.transform = `translate(${x * 4}px, ${y * 2}px) scale(1.02)`;
+      });
     };
 
     const handleMouseLeave = () => {
+      if (moveRaf.current) {
+        window.cancelAnimationFrame(moveRaf.current);
+        moveRaf.current = null;
+      }
       if (buttonRef.current) {
         buttonRef.current.style.transform = "";
       }

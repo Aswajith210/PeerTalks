@@ -66,9 +66,11 @@ export function FloatingPreview({ stream, audioEnabled, videoEnabled }: Floating
     if (!dragging) return;
 
     const handleMove = (clientX: number, clientY: number) => {
+      const w = expanded ? 280 : 160;
+      const h = expanded ? Math.round((280 * 9) / 16) : Math.round((160 * 4) / 3);
       setPosition({
-        x: Math.max(16, Math.min(clientX - dragOffset.current.x, window.innerWidth - 200)),
-        y: Math.max(80, Math.min(clientY - dragOffset.current.y, window.innerHeight - 180)),
+        x: Math.max(16, Math.min(clientX - dragOffset.current.x, window.innerWidth - w - 16)),
+        y: Math.max(80, Math.min(clientY - dragOffset.current.y, window.innerHeight - h - 16)),
       });
     };
 
@@ -77,8 +79,9 @@ export function FloatingPreview({ stream, audioEnabled, videoEnabled }: Floating
 
     const handleEnd = () => {
       setDragging(false);
+      const w = expanded ? 280 : 160;
       setPosition(prev => ({
-        x: prev.x < window.innerWidth / 2 ? 16 : window.innerWidth - 196,
+        x: prev.x < window.innerWidth / 2 ? 16 : window.innerWidth - w - 16,
         y: prev.y,
       }));
     };
@@ -94,7 +97,7 @@ export function FloatingPreview({ stream, audioEnabled, videoEnabled }: Floating
       window.removeEventListener("touchmove", handleTouchMove);
       window.removeEventListener("touchend", handleEnd);
     };
-  }, [dragging]);
+  }, [dragging, expanded]);
 
   if (!stream) return null;
 

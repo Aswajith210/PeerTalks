@@ -54,6 +54,10 @@ function InterestChatContent() {
   const timeoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const requestKeyRef = useRef<string | null>(null);
+  // Attempt generation: bumped on start/cancel/abort so a stale in-flight
+  // poll response (or its pending navigation timer) can never push the user
+  // into a room after they cancelled.
+  const attemptGenRef = useRef(0);
 
   useEffect(() => {
     createClient().then((client) => {
@@ -89,7 +93,11 @@ function InterestChatContent() {
       unsubscribeMatching();
       clearMatchingTimers();
       releaseLocalMedia();
-      fetch("/api/matching/interest", { method: "DELETE" }).catch(() => {});
+      const key = requestKeyRef.current;
+      fetch("/api/matching/interest", {
+        method: "DELETE",
+        headers: key ? { "x-request-id": key } : {},
+      }).catch(() => {});
     };
   }, [unsubscribeMatching, clearMatchingTimers, releaseLocalMedia]);
 
@@ -116,11 +124,40 @@ function InterestChatContent() {
     }
     if (matchingRef.current) return;
     matchingRef.current = true;
+    attemptGenRef.current++;
+    const gen = attemptGenRef.current;
 
     setStatus("matching");
     setError(null);
     unsubscribeMatching();
     clearMatchingTimers();
+
+    const abortWithError = (message: string) => {
+      console.error("[PeerTalks][MATCH] aborting with error", { message });
+      matchingRef.current = false;
+      attemptGenRef.current++;
+      clearMatchingTimers();
+      unsubscribeMatching();
+      releaseLocalMedia();
+      // Send the attempt's idempotency key so the server refund is keyed
+      // (a duplicate DELETE can never refund the same charge twice).
+      const key = requestKeyRef.current;
+      requestKeyRef.current = null;
+      // Remove any waiting queue row (and refund when one was removed) so
+      // a timed-out/failed attempt never strands tokens or queue entries.
+      fetch("/api/matching/interest", {
+        method: "DELETE",
+        headers: key ? { "x-request-id": key } : {},
+      })
+        .then(async (res) => {
+          const body = (await res.json().catch(() => null)) as { balance?: number } | null;
+          if (body && typeof body.balance === "number") setBalance(body.balance);
+        })
+        .catch(() => {});
+      void refresh();
+      setError(message);
+      setStatus("select");
+    };
 
     try {
       const supabase = supabaseRef.current;
@@ -182,12 +219,17 @@ function InterestChatContent() {
           (payload: { new: Record<string, unknown> }) => {
             const newData = payload.new as Record<string, unknown>;
             if (newData && newData.status === "matched" && newData.session_id) {
+              if (attemptGenRef.current !== gen) return;
               console.log("[PeerTalks][Realtime] matched event", { sessionId: newData.session_id });
               matchingRef.current = false;
               setStatus("connected");
               clearMatchingTimers();
               releaseLocalMedia();
-              setTimeout(() => router.push(`/chat/room/${newData.session_id}`), 500);
+              setTimeout(() => {
+                if (attemptGenRef.current === gen) {
+                  router.push(`/chat/room/${newData.session_id}`);
+                }
+              }, 500);
             }
           }
         )
@@ -200,26 +242,6 @@ function InterestChatContent() {
       // One idempotency key for the whole attempt: re-polling with the same
       // key can never charge the user twice.
       requestKeyRef.current = globalThis.crypto.randomUUID();
-
-      const abortWithError = (message: string) => {
-        console.error("[PeerTalks][MATCH] aborting with error", { message });
-        matchingRef.current = false;
-        clearMatchingTimers();
-        unsubscribeMatching();
-        releaseLocalMedia();
-        requestKeyRef.current = null;
-        // Remove any waiting queue row (and refund when one was removed) so
-        // a timed-out/failed attempt never strands tokens or queue entries.
-        fetch("/api/matching/interest", { method: "DELETE" })
-          .then(async (res) => {
-            const body = (await res.json().catch(() => null)) as { balance?: number } | null;
-            if (body && typeof body.balance === "number") setBalance(body.balance);
-          })
-          .catch(() => {});
-        void refresh();
-        setError(message);
-        setStatus("select");
-      };
 
       const attemptMatch = async (): Promise<boolean> => {
         const res = await fetch("/api/matching/interest", {
@@ -257,12 +279,17 @@ function InterestChatContent() {
         }
 
         if (data?.matched && data.sessionId) {
+          if (attemptGenRef.current !== gen) return false;
           console.log("[PeerTalks][Session] matched via response", { sessionId: data.sessionId });
           matchingRef.current = false;
           setStatus("connected");
           clearMatchingTimers();
           releaseLocalMedia();
-          setTimeout(() => router.push(`/chat/room/${data.sessionId}`), 800);
+          setTimeout(() => {
+            if (attemptGenRef.current === gen) {
+              router.push(`/chat/room/${data.sessionId}`);
+            }
+          }, 800);
           return true;
         }
 
@@ -293,22 +320,26 @@ function InterestChatContent() {
         );
       }, MATCHING_TIMEOUT_MS);
     } catch {
-      setError("Something went wrong. Please try again.");
-      setStatus("select");
-      matchingRef.current = false;
-      clearMatchingTimers();
-      releaseLocalMedia();
-      requestKeyRef.current = null;
+      abortWithError("Something went wrong. Please try again.");
     }
   }, [interests, callType, router, unsubscribeMatching, refresh, setBalance, clearMatchingTimers, releaseLocalMedia]);
 
   const cancelMatching = useCallback(async () => {
+    // Bump the attempt generation: an in-flight poll response (or its
+    // pending navigation timer) must never push us into a room after the
+    // user already pressed Cancel.
+    attemptGenRef.current++;
     matchingRef.current = false;
     clearMatchingTimers();
     unsubscribeMatching();
     releaseLocalMedia();
+    const key = requestKeyRef.current;
     requestKeyRef.current = null;
-    const res = await fetch("/api/matching/interest", { method: "DELETE" }).catch(() => null);
+    const res = await fetch("/api/matching/interest", {
+      method: "DELETE",
+      headers: key ? { "x-request-id": key } : {},
+      body: JSON.stringify({ cleanupMatched: true }),
+    }).catch(() => null);
     if (res) {
       const body = (await res.json().catch(() => null)) as { balance?: number } | null;
       if (body && typeof body.balance === "number") setBalance(body.balance);

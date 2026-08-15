@@ -78,7 +78,14 @@ function DashboardContent() {
         if (typeof data.balance === "number") setBalance(data.balance);
         await refresh();
         if (data.claimed) {
-          toast.success("Daily tokens claimed!", `${data.balance} tokens available`);
+          const claimedBalance =
+            typeof data.balance === "number"
+              ? data.balance
+              : (await refresh());
+          toast.success(
+            "Daily tokens claimed!",
+            `${typeof claimedBalance === "number" ? claimedBalance : "Your"} tokens available`
+          );
         }
       } catch {}
     };

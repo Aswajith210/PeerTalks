@@ -195,6 +195,7 @@ create policy "Session participants can insert messages"
       where id = session_id
         and (user1_id = auth.uid() or user2_id = auth.uid())
     )
+    and sender_id = auth.uid()
   );
 
 create index if not exists idx_messages_session on public.messages(session_id);

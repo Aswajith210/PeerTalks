@@ -222,27 +222,30 @@ export async function deductTokens(
   }
 
   // ── Fallback: optimistic locking on the balance column ──
-  // First honor idempotency: if this exact operation already committed,
-  // replay it as a no-op so retried requests never double-charge.
-  if (idempotencyKey) {
-    const { data: existing } = await supabase
-      .from("token_transactions")
-      .select("id")
-      .eq("user_id", userId)
-      .eq("idempotency_key", idempotencyKey)
-      .maybeSingle();
-
-    if (existing) {
-      const { data: knownBalance } = await supabase
-        .from("token_balances")
-        .select("balance")
-        .eq("user_id", userId)
-        .maybeSingle();
-      return { success: true, balance: knownBalance?.balance ?? 0, idempotent: true };
-    }
-  }
-
   for (let attempt = 0; attempt < 3; attempt++) {
+    // Idempotency re-check INSIDE the loop, immediately before each update:
+    // two concurrent requests with the same key can both pass a single
+    // pre-check, then both succeed on different balance snapshots. Checking
+    // here (after the concurrent request has committed its audit row)
+    // converts the loser into an idempotent no-op.
+    if (idempotencyKey) {
+      const { data: existing } = await supabase
+        .from("token_transactions")
+        .select("id")
+        .eq("user_id", userId)
+        .eq("idempotency_key", idempotencyKey)
+        .maybeSingle();
+
+      if (existing) {
+        const { data: knownBalance } = await supabase
+          .from("token_balances")
+          .select("balance")
+          .eq("user_id", userId)
+          .maybeSingle();
+        return { success: true, balance: knownBalance?.balance ?? 0, idempotent: true };
+      }
+    }
+
     const { data: balance } = await supabase
       .from("token_balances")
       .select("balance")

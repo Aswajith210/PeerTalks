@@ -93,7 +93,7 @@ export async function POST(request: Request) {
       status: "waiting",
       call_type: callType,
       user1_id: session.user.id,
-      room_id: room.id,
+      room_id: room.id.toString(),
     })
     .select()
     .single();

@@ -170,19 +170,6 @@ export async function POST(request: Request) {
     userId, idempotent: deduction.idempotent, balance: deduction.balance,
   });
 
-  // A replayed request (same idempotency key, e.g. our client's waiting
-  // poll) must not stack a second waiting row for this user — drop the
-  // stale one so the RPC matches fresh rows only. (Matched rows are
-  // intentionally kept — they are the recovery record for this attempt.)
-  if (deduction.idempotent) {
-    await supabase
-      .from("matching_queue")
-      .delete()
-      .eq("user_id", userId)
-      .eq("mode", "random")
-      .eq("status", "waiting");
-  }
-
   // Pre-check: if the PEER's RPC already matched us while our previous
   // poll was in flight, return that exact session instead of letting our
   // own RPC match a THIRD user (the duplicate-session race).
@@ -270,6 +257,19 @@ export async function POST(request: Request) {
     });
   }
 
+  // Idempotent replay: the FIRST POST of this attempt already inserted the
+  // waiting row, so re-inserting one here would stack a second row AND make
+  // the refund-on-DELETE race refundable twice (POST commit → DELETE refund
+  // → in-flight replay re-inserts → second DELETE refunds again = mint).
+  // Replays just report the still-queued state.
+  if (deduction.idempotent) {
+    return NextResponse.json({
+      matched: false,
+      message: "Waiting for a match...",
+      balance: deduction.balance,
+    });
+  }
+
   const { data: queueEntry, error: queueError } = await supabase
     .from("matching_queue")
     .insert({ user_id: userId, mode: "random", call_type: callType, status: "waiting" })
@@ -310,6 +310,12 @@ export async function DELETE(request: Request) {
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   console.log("[PeerTalks][AUTH] random DELETE", { userId: session.user.id });
 
+  // The attempt's idempotency key (sent by the client's matching page):
+  // the refund derives `refund:<key>`, so a retried/duplicated DELETE can
+  // never refund the same charge twice (keyless refunds were the
+  // POST-commit → DELETE-refund → replay-reinsert → DELETE-refund race).
+  const requestKey = parseRequestKey(request);
+
   // Body flag: the chat room calls this when leaving a session so stale
   // "matched" rows are purged too (they must never resurrect an old
   // session during the next matching attempt). Matched rows are never
@@ -333,7 +339,12 @@ export async function DELETE(request: Request) {
     .select("id");
 
   if (deleted && deleted.length > 0) {
-    const refund = await refundTokens(session.user.id, TOKEN_COSTS.VIDEO_CHAT);
+    const refund = await refundTokens(
+      session.user.id,
+      TOKEN_COSTS.VIDEO_CHAT,
+      undefined,
+      requestKey ? refundKeyFor(requestKey) : undefined
+    );
     if (cleanupMatched) {
       await supabase
         .from("matching_queue")

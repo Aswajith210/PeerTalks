@@ -156,6 +156,21 @@ export async function POST(request: Request) {
   const userId = session.user.id;
   console.log("[PeerTalks][Auth] interest POST", { userId });
 
+  // Per-item validation: a non-string item (e.g. a number) would throw in
+  // the normalization below and 500 the route; oversize items bloat the
+  // queue rows. Max 60 chars per interest.
+  if (
+    !Array.isArray(rawInterests) ||
+    rawInterests.some(
+      (i) => typeof i !== "string" || i.trim().length === 0 || i.trim().length > 60
+    )
+  ) {
+    return NextResponse.json(
+      { error: "Interests must be non-empty strings up to 60 characters" },
+      { status: 400 }
+    );
+  }
+
   // Normalize once: the find_interest_match RPC compares interests with
   // exact equality, so chips ("Gaming") and typed entries ("gaming") must
   // share one casing. Lowercase+trim here so the queue row, the RPC call
@@ -190,16 +205,15 @@ export async function POST(request: Request) {
     userId, idempotent: deduction.idempotent, balance: deduction.balance,
   });
 
-  // A replayed request (same idempotency key, e.g. our client's waiting
-  // poll) must not stack a second waiting row for this user. (Matched rows
-  // are kept — they are the recovery record for this attempt.)
+  // A replayed request must not stack a second waiting row — the original
+  // POST of this attempt already queued one (see random route: replay does
+  // not re-insert, which also closes the double-refund DELETE race).
   if (deduction.idempotent) {
-    await supabase
-      .from("matching_queue")
-      .delete()
-      .eq("user_id", userId)
-      .eq("mode", "interest")
-      .eq("status", "waiting");
+    return NextResponse.json({
+      matched: false,
+      message: "Looking for someone who shares your interests...",
+      balance: deduction.balance,
+    });
   }
 
   // Pre-check: if the PEER's RPC already matched us while our previous
@@ -325,6 +339,10 @@ export async function DELETE(request: Request) {
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   console.log("[PeerTalks][Auth] interest DELETE", { userId: session.user.id });
 
+  // The attempt's idempotency key — the refund derives `refund:<key>` so a
+  // duplicated DELETE can never refund the same charge twice (see random).
+  const requestKey = parseRequestKey(request);
+
   let cleanupMatched = false;
   try {
     const body = await request.json();
@@ -341,7 +359,12 @@ export async function DELETE(request: Request) {
     .select("id");
 
   if (deleted && deleted.length > 0) {
-    const refund = await refundTokens(session.user.id, TOKEN_COSTS.VIDEO_CHAT);
+    const refund = await refundTokens(
+      session.user.id,
+      TOKEN_COSTS.VIDEO_CHAT,
+      undefined,
+      requestKey ? refundKeyFor(requestKey) : undefined
+    );
     if (cleanupMatched) {
       await supabase
         .from("matching_queue")

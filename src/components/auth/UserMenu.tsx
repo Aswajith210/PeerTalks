@@ -2,6 +2,7 @@
 
 import { createClient } from "@/lib/supabase/client";
 import { useEffect, useState } from "react";
+import type { User as SupabaseUser } from "@supabase/supabase-js";
 import { Avatar } from "@/components/ui/Avatar";
 import { useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
@@ -21,33 +22,62 @@ export function UserMenu() {
 
   useEffect(() => {
     let mounted = true;
+    let authSubscription: { unsubscribe: () => void } | null = null;
+
+    // Re-fetch the profile for the CURRENT account. Called on init and again
+    // on every auth event so switching accounts (same tab, no reload) never
+    // shows the previous account's name/avatar.
+    const loadFor = async (u: SupabaseUser) => {
+      const supabase = await createClient();
+      if (!supabase) return;
+      const { data: profile } = await supabase
+        .from("profiles")
+        .select("username, display_name, avatar_url")
+        .eq("id", u.id)
+        .single();
+      if (!mounted) return;
+      setUser({
+        id: u.id,
+        email: u.email ?? undefined,
+        display_name:
+          profile?.display_name || u.user_metadata?.full_name || undefined,
+        avatar_url:
+          profile?.avatar_url || u.user_metadata?.avatar_url || undefined,
+      });
+    };
+
     const init = async () => {
       const supabase = await createClient();
       if (!supabase) { if (mounted) setLoading(false); return; }
 
-      const { data: { session } } = await supabase.auth.getSession();
+      const { data: { user } } = await supabase.auth.getUser();
       if (!mounted) return;
-
-      if (session?.user) {
-        const { data: profile } = await supabase
-          .from("profiles")
-          .select("username, display_name, avatar_url")
-          .eq("id", session.user.id)
-          .single();
-
-        if (mounted) {
-          setUser({
-            id: session.user.id,
-            email: session.user.email,
-            display_name: profile?.display_name || session.user.user_metadata?.full_name,
-            avatar_url: profile?.avatar_url || session.user.user_metadata?.avatar_url,
-          });
-        }
+      if (user) {
+        await loadFor(user);
+      } else {
+        setUser(null);
       }
       if (mounted) setLoading(false);
+
+      const { data: { subscription } } = supabase.auth.onAuthStateChange(
+        (_event, session) => {
+          if (!mounted) return;
+          const u = session?.user;
+          if (u) {
+            void loadFor(u);
+          } else {
+            setUser(null);
+          }
+        }
+      );
+      authSubscription = subscription;
     };
-    init();
-    return () => { mounted = false; };
+    void init();
+
+    return () => {
+      mounted = false;
+      authSubscription?.unsubscribe();
+    };
   }, []);
 
   const handleLogout = async () => {
