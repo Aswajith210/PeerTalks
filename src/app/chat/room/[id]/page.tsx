@@ -399,6 +399,9 @@ function ChatRoomContent() {
         // getUserMedia would pick the camera's maximum (4K on phones).
         const stream = await startLocalStream();
         if (!cancelled) {
+          console.log("[PeerTalks][WEBRTC] local media acquired", {
+            tracks: stream.getTracks().map((t) => `${t.kind}:${t.readyState}`).join(", "),
+          });
           setLocalStream(stream);
           localStreamRef.current = stream;
           setMediaError(null);
@@ -412,6 +415,9 @@ function ChatRoomContent() {
         try {
           const stream = await startLocalStream({ video: false, audio: true });
           if (!cancelled) {
+            console.log("[PeerTalks][WEBRTC] local media acquired (audio only)", {
+              tracks: stream.getTracks().map((t) => `${t.kind}:${t.readyState}`).join(", "),
+            });
             setLocalStream(stream);
             localStreamRef.current = stream;
             setVideoEnabled(false);
@@ -550,7 +556,7 @@ function ChatRoomContent() {
         return;
       }
       if (signal.type === "offer") {
-        console.log("[PeerTalks][WebRTC] offer received");
+        console.log("[PeerTalks][WEBRTC] offer received", { signalingState: pc.signalingState });
         try {
           if (pc.signalingState !== "have-local-offer") {
             await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: signal.sdp! }));
@@ -572,7 +578,7 @@ function ChatRoomContent() {
         }
       } else if (signal.type === "answer") {
         try {
-          console.log("[PeerTalks][WEBRTC] answer received");
+          console.log("[PeerTalks][WEBRTC] answer received", { signalingState: pc.signalingState });
           if (pc.signalingState !== "stable") {
             await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: signal.sdp! }));
           }
@@ -592,6 +598,12 @@ function ChatRoomContent() {
     });
 
     pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        console.log("[PeerTalks][WEBRTC] ice candidate gathered", {
+          type: event.candidate.type,
+          protocol: event.candidate.protocol,
+        });
+      }
       if (event.candidate && channel.state === "subscribed" as string) {
         channel.send({
           type: "broadcast",
@@ -678,12 +690,40 @@ function ChatRoomContent() {
           { urls: "stun:stun1.l.google.com:19302" },
         ],
       });
+      console.log("[PeerTalks][WEBRTC] pc created", { sessionId: id, userId: userIdRef.current });
 
+      // Tracks the remote media stream across ontrack events. Some browsers
+      // (WebKit/Safari) fire ontrack with an empty `streams` array, or
+      // deliver audio/video as separate stream objects — merging every track
+      // into ONE stream guarantees the remote video element always receives
+      // the video track instead of staying black/empty while the connection
+      // itself reports "connected".
+      let remoteStream: MediaStream | null = null;
       pc.ontrack = (event) => {
-        console.log("[PeerTalks][WEBRTC] remote stream received", {
-          streams: event.streams.length, trackKind: event.track?.kind,
+        console.log("[PeerTalks][WEBRTC] ontrack fired", {
+          trackKind: event.track?.kind,
+          trackEnabled: event.track?.enabled,
+          trackReadyState: event.track?.readyState,
+          streams: event.streams.length,
+          hasStream: !!event.streams[0],
         });
-        if (event.streams[0]) setRemoteStream(event.streams[0]);
+        if (event.streams && event.streams[0]) {
+          remoteStream = event.streams[0];
+          setRemoteStream(remoteStream);
+        } else if (event.track) {
+          if (!remoteStream) {
+            remoteStream = new MediaStream([event.track]);
+            setRemoteStream(remoteStream);
+          } else {
+            const alreadyAdded = remoteStream
+              .getTracks()
+              .some((t) => t.id === event.track?.id);
+            if (!alreadyAdded) {
+              remoteStream.addTrack(event.track);
+            }
+            setRemoteStream(remoteStream);
+          }
+        }
       };
 
       pc.oniceconnectionstatechange = () => {

@@ -28,10 +28,26 @@ export function VideoCard({
     if (!el) return;
     if (stream) {
       el.srcObject = stream;
+      console.log("[PeerTalks][WEBRTC] video srcObject set", {
+        label,
+        videoTracks: stream.getVideoTracks().length,
+        audioTracks: stream.getAudioTracks().length,
+        muted,
+      });
+      if (!muted) {
+        // Autoplay policy (esp. mobile Safari) blocks unmuted playback —
+        // without an explicit play() the element keeps srcObject but stays
+        // black. The call start is user-gesture driven, so play() resolves.
+        el.play().catch((e: unknown) => {
+          console.warn("[PeerTalks][WEBRTC] remote play() blocked", {
+            name: e instanceof Error ? e.name : String(e),
+          });
+        });
+      }
     } else {
       el.srcObject = null;
     }
-  }, [stream]);
+  }, [stream, muted, label]);
 
   return (
     <div className={`relative w-full h-full flex items-center justify-center overflow-hidden rounded-3xl bg-black/40 border border-white/[0.04] ${stream ? "" : "shadow-premium-lg"}`}>
@@ -41,6 +57,28 @@ export function VideoCard({
           autoPlay
           playsInline
           muted={muted}
+          onLoadedMetadata={(e) => {
+            const v = e.currentTarget;
+            console.log("[PeerTalks][WEBRTC] remote video metadata", {
+              label,
+              videoWidth: v.videoWidth,
+              videoHeight: v.videoHeight,
+              readyState: v.readyState,
+            });
+          }}
+          onPlay={() => {
+            console.log("[PeerTalks][WEBRTC] remote video playing", {
+              label,
+              videoWidth: videoRef.current?.videoWidth ?? 0,
+              videoHeight: videoRef.current?.videoHeight ?? 0,
+            });
+          }}
+          onError={(e) => {
+            console.warn("[PeerTalks][WEBRTC] remote video error", {
+              label,
+              error: e.currentTarget.error?.message ?? String(e),
+            });
+          }}
           className={`w-full h-full object-cover transition-opacity duration-500 ${
             mirrored ? "-scale-x-100" : ""
           }`}
