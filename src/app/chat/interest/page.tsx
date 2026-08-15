@@ -11,6 +11,8 @@ import { motion, AnimatePresence } from "framer-motion";
 import { createClient } from "@/lib/supabase/client";
 import type { SupabaseClient, RealtimeChannel } from "@supabase/supabase-js";
 import { useTokens } from "@/hooks/useTokens";
+import { startLocalStream, stopLocalStream } from "@/lib/webrtc/peerConnection";
+import { MATCHING_TIMEOUT_MS } from "@/lib/constants";
 
 const SUGGESTED_INTERESTS = [
   "Music", "Gaming", "Art", "Technology",
@@ -18,6 +20,24 @@ const SUGGESTED_INTERESTS = [
   "Cooking", "Photography", "Fitness", "Science",
   "Anime", "Fashion", "Nature", "Philosophy",
 ];
+
+const MEDIA_ERROR_MESSAGES: Record<string, string> = {
+  NotAllowedError:
+    "Camera and microphone access was denied. Please allow camera and microphone for this site, then try again.",
+  NotFoundError: "No camera or microphone was found on this device.",
+  NotReadableError:
+    "Your camera or microphone is in use by another application. Close it and try again.",
+  OverconstrainedError:
+    "Your camera could not start with the required settings. Try again.",
+  SecurityError:
+    "Camera and microphone access is only available over a secure (HTTPS) connection.",
+};
+
+function mediaErrorMessage(error: unknown): string {
+  const name = error instanceof DOMException ? error.name : (error as { name?: string })?.name;
+  if (name && MEDIA_ERROR_MESSAGES[name]) return MEDIA_ERROR_MESSAGES[name];
+  return "Camera and microphone access is required for video chat.";
+}
 
 function InterestChatContent() {
   const router = useRouter();
@@ -31,6 +51,9 @@ function InterestChatContent() {
   const subscriptionRef = useRef<RealtimeChannel | null>(null);
   const matchingRef = useRef(false);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const timeoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const requestKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     createClient().then((client) => {
@@ -50,15 +73,25 @@ function InterestChatContent() {
       clearInterval(pollTimerRef.current);
       pollTimerRef.current = null;
     }
+    if (timeoutTimerRef.current) {
+      clearTimeout(timeoutTimerRef.current);
+      timeoutTimerRef.current = null;
+    }
+  }, []);
+
+  const releaseLocalMedia = useCallback(() => {
+    stopLocalStream(localStreamRef.current);
+    localStreamRef.current = null;
   }, []);
 
   useEffect(() => {
     return () => {
       unsubscribeMatching();
       clearMatchingTimers();
+      releaseLocalMedia();
       fetch("/api/matching/interest", { method: "DELETE" }).catch(() => {});
     };
-  }, [unsubscribeMatching, clearMatchingTimers]);
+  }, [unsubscribeMatching, clearMatchingTimers, releaseLocalMedia]);
 
   const toggleInterest = (interest: string) => {
     setInterests((prev) =>
@@ -92,19 +125,49 @@ function InterestChatContent() {
     try {
       const supabase = supabaseRef.current;
       if (!supabase) {
+        setError("Failed to initialize connection");
+        setStatus("select");
         matchingRef.current = false;
         return;
       }
 
-      const { data: { session } } = await supabase.auth.getSession();
-      const userId = session?.user.id;
+      const { data: { user } } = await supabase.auth.getUser();
+      const userId = user?.id ?? (await supabase.auth.getSession()).data.session?.user.id;
       if (!userId) {
         setError("Not signed in");
         setStatus("select");
         matchingRef.current = false;
         return;
       }
-      console.log("[PeerTalks][Auth] interest startMatching", { userId, callType });
+      console.log("[PeerTalks][AUTH] interest startMatching", { userId, callType });
+
+      // Video chat requests camera/mic BEFORE entering the queue — the
+      // user must see the permission prompt now, and any denial must be
+      // visible instead of silently waiting forever. Text never requests
+      // media.
+      if (callType === "video") {
+        try {
+          // startLocalStream() defaults carry the 720p caps — unconstrained
+          // getUserMedia would pick the camera's maximum (4K on phones).
+          const stream = await startLocalStream();
+          localStreamRef.current = stream;
+          console.log("[PeerTalks][MEDIA] local stream acquired", {
+            videoTracks: stream.getVideoTracks().length,
+            audioTracks: stream.getAudioTracks().length,
+          });
+        } catch (mediaError) {
+          const message = mediaErrorMessage(mediaError);
+          console.error("[PeerTalks][MEDIA] getUserMedia failed", {
+            name: mediaError instanceof DOMException ? mediaError.name : String(mediaError),
+          });
+          setError(message);
+          setStatus("select");
+          matchingRef.current = false;
+          return;
+        }
+      } else {
+        console.log("[PeerTalks][MEDIA] text chat — no camera/mic requested");
+      }
 
       const channel = supabase
         .channel(`interest_matching_${userId}`)
@@ -120,8 +183,10 @@ function InterestChatContent() {
             const newData = payload.new as Record<string, unknown>;
             if (newData && newData.status === "matched" && newData.session_id) {
               console.log("[PeerTalks][Realtime] matched event", { sessionId: newData.session_id });
+              matchingRef.current = false;
               setStatus("connected");
               clearMatchingTimers();
+              releaseLocalMedia();
               setTimeout(() => router.push(`/chat/room/${newData.session_id}`), 500);
             }
           }
@@ -134,7 +199,27 @@ function InterestChatContent() {
 
       // One idempotency key for the whole attempt: re-polling with the same
       // key can never charge the user twice.
-      const requestKey = globalThis.crypto.randomUUID();
+      requestKeyRef.current = globalThis.crypto.randomUUID();
+
+      const abortWithError = (message: string) => {
+        console.error("[PeerTalks][MATCH] aborting with error", { message });
+        matchingRef.current = false;
+        clearMatchingTimers();
+        unsubscribeMatching();
+        releaseLocalMedia();
+        requestKeyRef.current = null;
+        // Remove any waiting queue row (and refund when one was removed) so
+        // a timed-out/failed attempt never strands tokens or queue entries.
+        fetch("/api/matching/interest", { method: "DELETE" })
+          .then(async (res) => {
+            const body = (await res.json().catch(() => null)) as { balance?: number } | null;
+            if (body && typeof body.balance === "number") setBalance(body.balance);
+          })
+          .catch(() => {});
+        void refresh();
+        setError(message);
+        setStatus("select");
+      };
 
       const attemptMatch = async (): Promise<boolean> => {
         const res = await fetch("/api/matching/interest", {
@@ -142,25 +227,41 @@ function InterestChatContent() {
           headers: {
             "Content-Type": "application/json",
             "x-call-type": callType,
-            "x-request-id": requestKey,
+            "x-request-id": requestKeyRef.current ?? "",
           },
           body: JSON.stringify({ interests }),
         });
-        const data = await res.json();
-        if (typeof data.balance === "number") setBalance(data.balance);
+        const data = await res.json().catch(() => null);
+        if (typeof data?.balance === "number") setBalance(data.balance);
         void refresh();
 
-        if (!res.ok) {
+        if (!res.ok || data?.error) {
           console.warn("[PeerTalks][Match RPC] POST rejected", {
             userId, status: res.status, body: data,
           });
+          if (data?.reason === "matchmaking_unavailable") {
+            abortWithError(
+              data.error ??
+                "Matchmaking isn't ready yet. Check the database setup and try again in a moment."
+            );
+          } else if (data?.reason === "queue_insert_failed") {
+            abortWithError(data.error ?? "Could not join the matching queue. Please try again.");
+          } else if (res.status === 429) {
+            abortWithError("Too many requests. Wait a moment and try again.");
+          } else if (res.status === 400) {
+            abortWithError(data?.error ?? "You don't have enough tokens for this chat.");
+          } else {
+            abortWithError(data?.error ?? "Could not start matchmaking. Please try again.");
+          }
           return false;
         }
 
-        if (data.matched && data.sessionId) {
+        if (data?.matched && data.sessionId) {
           console.log("[PeerTalks][Session] matched via response", { sessionId: data.sessionId });
+          matchingRef.current = false;
           setStatus("connected");
           clearMatchingTimers();
+          releaseLocalMedia();
           setTimeout(() => router.push(`/chat/room/${data.sessionId}`), 800);
           return true;
         }
@@ -183,18 +284,30 @@ function InterestChatContent() {
         const hit = await attemptMatch();
         if (hit) clearMatchingTimers();
       }, 4000);
+
+      // Never leave the user on "Looking for someone" indefinitely.
+      timeoutTimerRef.current = setTimeout(() => {
+        if (!matchingRef.current) return;
+        abortWithError(
+          "Couldn't find a match this time. Please try again — both users need to be waiting at the same time."
+        );
+      }, MATCHING_TIMEOUT_MS);
     } catch {
       setError("Something went wrong. Please try again.");
       setStatus("select");
       matchingRef.current = false;
       clearMatchingTimers();
+      releaseLocalMedia();
+      requestKeyRef.current = null;
     }
-  }, [interests, callType, router, unsubscribeMatching, refresh, setBalance, clearMatchingTimers]);
+  }, [interests, callType, router, unsubscribeMatching, refresh, setBalance, clearMatchingTimers, releaseLocalMedia]);
 
   const cancelMatching = useCallback(async () => {
     matchingRef.current = false;
     clearMatchingTimers();
     unsubscribeMatching();
+    releaseLocalMedia();
+    requestKeyRef.current = null;
     const res = await fetch("/api/matching/interest", { method: "DELETE" }).catch(() => null);
     if (res) {
       const body = (await res.json().catch(() => null)) as { balance?: number } | null;
@@ -202,7 +315,7 @@ function InterestChatContent() {
     }
     await refresh();
     setStatus("select");
-  }, [unsubscribeMatching, refresh, setBalance, clearMatchingTimers]);
+  }, [unsubscribeMatching, refresh, setBalance, clearMatchingTimers, releaseLocalMedia]);
 
   return (
     <div className="min-h-screen flex items-center justify-center px-4 pt-16">

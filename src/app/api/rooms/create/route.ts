@@ -33,6 +33,10 @@ export async function POST(request: Request) {
   }
 
   const { name, password } = body;
+  const callType = request.headers.get("x-call-type") ?? "video";
+  if (callType !== "video" && callType !== "text") {
+    return NextResponse.json({ error: "Invalid call type" }, { status: 400 });
+  }
 
   const deduction = await deductTokens(
     session.user.id,
@@ -50,6 +54,9 @@ export async function POST(request: Request) {
       { status: 400 }
     );
   }
+  console.log("[PeerTalks][TOKENS] room create deducted", {
+    userId: session.user.id, idempotent: deduction.idempotent, balance: deduction.balance,
+  });
 
   const passwordHash = await bcrypt.hash(password, 10);
 
@@ -64,7 +71,12 @@ export async function POST(request: Request) {
     .single();
 
   if (!room) {
-    await refundOnError(session.user.id, requestKey);
+    // Only refund when THIS request actually charged — an idempotent replay
+    // (network retry of a committed create) must not be refunded again or
+    // the user would mint tokens.
+    if (!deduction.idempotent) {
+      await refundOnError(session.user.id, requestKey);
+    }
     if (roomError?.code === "23505") {
       return NextResponse.json(
         { error: "A room with this name already exists. Choose another name." },
@@ -79,6 +91,7 @@ export async function POST(request: Request) {
     .insert({
       mode: "private_room",
       status: "waiting",
+      call_type: callType,
       user1_id: session.user.id,
       room_id: room.id,
     })
@@ -88,7 +101,9 @@ export async function POST(request: Request) {
   if (!chatSession) {
     // Room created but session failed — clean up
     await supabase.from("private_rooms").delete().eq("id", room.id);
-    await refundOnError(session.user.id, requestKey);
+    if (!deduction.idempotent) {
+      await refundOnError(session.user.id, requestKey);
+    }
     return NextResponse.json({ error: "Failed to create chat session" }, { status: 500 });
   }
 

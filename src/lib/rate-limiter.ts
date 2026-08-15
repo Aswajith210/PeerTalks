@@ -3,7 +3,10 @@ const requestCounts = new Map<string, { count: number; resetAt: number }>();
 const LIMITS: Record<string, { window: number; max: number }> = {
   default: { window: 60_000, max: 60 },
   auth: { window: 60_000, max: 10 },
-  matching: { window: 30_000, max: 15 },
+  // Random/interest matching polls every ~4s. Two testers on one household
+  // IP (laptop + phone) previously tripped 15/30s, every poll 429'd, and the
+  // client silently kept "Finding someone" forever. 60/min fits both devices.
+  matching: { window: 60_000, max: 60 },
   rooms: { window: 60_000, max: 20 },
   messages: { window: 60_000, max: 30 },
   tokens: { window: 10_000, max: 10 },

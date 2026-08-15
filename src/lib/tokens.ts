@@ -11,7 +11,8 @@ export interface TokenResult {
 
 export interface DailyClaimResult {
   claimed: boolean;
-  balance: number;
+  /** Authoritative balance after the claim; null when unknown (read blocked). */
+  balance: number | null;
 }
 
 const UUID_RE =
@@ -177,7 +178,7 @@ export async function ensureDailyTokens(
     .select("balance")
     .eq("user_id", userId)
     .maybeSingle();
-  return { claimed: false, balance: finalBalance?.balance ?? 0 };
+  return { claimed: false, balance: finalBalance?.balance ?? null };
 }
 
 /**

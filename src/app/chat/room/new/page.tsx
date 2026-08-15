@@ -14,6 +14,7 @@ function PrivateRoomContent() {
   const router = useRouter();
   const { refresh, setBalance } = useTokens();
   const [tab, setTab] = useState<"create" | "join">("create");
+  const [callType, setCallType] = useState<"video" | "text">("video");
   const [name, setName] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -33,6 +34,7 @@ function PrivateRoomContent() {
         headers: {
           "Content-Type": "application/json",
           "x-request-id": globalThis.crypto.randomUUID(),
+          "x-call-type": callType,
         },
         body: JSON.stringify({ name, password }),
       });
@@ -71,6 +73,7 @@ function PrivateRoomContent() {
         headers: {
           "Content-Type": "application/json",
           "x-request-id": globalThis.crypto.randomUUID(),
+          "x-call-type": callType,
         },
         body: JSON.stringify({ name, password }),
       });
@@ -127,6 +130,29 @@ function PrivateRoomContent() {
             </button>
           </div>
 
+          <div className="flex rounded-lg bg-white/5 border border-white/10 p-0.5 mb-6">
+            <button
+              onClick={() => { setCallType("video"); setError(null); }}
+              className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-all ${
+                callType === "video"
+                  ? "bg-white/10 text-white border border-white/10"
+                  : "text-white/40 hover:text-white/60"
+              } focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20`}
+            >
+              Video
+            </button>
+            <button
+              onClick={() => { setCallType("text"); setError(null); }}
+              className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-all ${
+                callType === "text"
+                  ? "bg-white/10 text-white border border-white/10"
+                  : "text-white/40 hover:text-white/60"
+              } focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20`}
+            >
+              Text
+            </button>
+          </div>
+
           <motion.div
             key={tab}
             initial={{ opacity: 0, y: 5 }}
@@ -155,7 +181,8 @@ function PrivateRoomContent() {
               loading={loading}
               onClick={tab === "create" ? handleCreate : handleJoin}
             >
-              {tab === "create" ? "Create Room (5 tokens)" : "Join Room (5 tokens)"}
+              {tab === "create" ? "Create " : "Join "}
+              {callType === "video" ? "Video" : "Text"} Room (5 tokens)
             </Button>
           </motion.div>
         </div>

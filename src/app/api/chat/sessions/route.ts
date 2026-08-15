@@ -69,5 +69,20 @@ export async function POST(request: Request) {
     .select()
     .single();
 
+  // Private rooms die with their session: once the chat is over the room
+  // must not accept a NEW guest (who would wait forever for a host that
+  // has gone). Only the host can deactivate (RLS: host-only update) — the
+  // guest's attempt is a harmless no-op.
+  if (chatSession?.room_id) {
+    await supabase
+      .from("private_rooms")
+      .update({ is_active: false, ended_at: new Date().toISOString() })
+      .eq("id", chatSession.room_id)
+      .eq("host_id", session.user.id);
+    console.log("[PeerTalks][ROOM] private room closed", {
+      roomId: chatSession.room_id, userId: session.user.id,
+    });
+  }
+
   return NextResponse.json(chatSession);
 }

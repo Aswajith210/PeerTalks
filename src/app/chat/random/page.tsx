@@ -10,6 +10,8 @@ import { motion, AnimatePresence } from "framer-motion";
 import { createClient } from "@/lib/supabase/client";
 import type { SupabaseClient, RealtimeChannel } from "@supabase/supabase-js";
 import { useTokens } from "@/hooks/useTokens";
+import { startLocalStream, stopLocalStream } from "@/lib/webrtc/peerConnection";
+import { MATCHING_TIMEOUT_MS } from "@/lib/constants";
 
 function MatchingAnimation() {
   return (
@@ -34,6 +36,24 @@ function MatchingAnimation() {
   );
 }
 
+const MEDIA_ERROR_MESSAGES: Record<string, string> = {
+  NotAllowedError:
+    "Camera and microphone access was denied. Please allow camera and microphone for this site, then try again.",
+  NotFoundError: "No camera or microphone was found on this device.",
+  NotReadableError:
+    "Your camera or microphone is in use by another application. Close it and try again.",
+  OverconstrainedError:
+    "Your camera could not start with the required settings. Try again.",
+  SecurityError:
+    "Camera and microphone access is only available over a secure (HTTPS) connection.",
+};
+
+function mediaErrorMessage(error: unknown): string {
+  const name = error instanceof DOMException ? error.name : (error as { name?: string })?.name;
+  if (name && MEDIA_ERROR_MESSAGES[name]) return MEDIA_ERROR_MESSAGES[name];
+  return "Camera and microphone access is required for video chat.";
+}
+
 function RandomChatContent() {
   const router = useRouter();
   const { refresh, setBalance } = useTokens();
@@ -43,6 +63,9 @@ function RandomChatContent() {
   const subscriptionRef = useRef<RealtimeChannel | null>(null);
   const matchingRef = useRef(false);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const timeoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const requestKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     createClient().then((client) => {
@@ -62,6 +85,15 @@ function RandomChatContent() {
       clearInterval(pollTimerRef.current);
       pollTimerRef.current = null;
     }
+    if (timeoutTimerRef.current) {
+      clearTimeout(timeoutTimerRef.current);
+      timeoutTimerRef.current = null;
+    }
+  }, []);
+
+  const releaseLocalMedia = useCallback(() => {
+    stopLocalStream(localStreamRef.current);
+    localStreamRef.current = null;
   }, []);
 
   const startMatching = useCallback(async (callType: "video" | "text" = "video") => {
@@ -81,15 +113,45 @@ function RandomChatContent() {
         return;
       }
 
-      const { data: { session } } = await supabase.auth.getSession();
-      const userId = session?.user.id;
+      const { data: { user } } = await supabase.auth.getUser();
+      const userId = user?.id ?? (await supabase.auth.getSession()).data.session?.user.id;
       if (!userId) {
         setMatchError("Not signed in");
         setStatus("select");
         matchingRef.current = false;
         return;
       }
-      console.log("[PeerTalks][Auth] random startMatching", { userId, callType });
+      console.log("[PeerTalks][AUTH] authenticated: true");
+      console.log("[PeerTalks][AUTH] userId:", userId);
+      console.log("[PeerTalks][AUTH] random startMatching", { userId, callType });
+
+      // Video chat requires camera/mic BEFORE we ever enter the queue —
+      // the user must see the permission prompt now, and any denial must
+      // be visible instead of silently waiting forever. Text chat never
+      // requests media.
+      if (callType === "video") {
+        try {
+          // startLocalStream() defaults carry the 720p caps — unconstrained
+          // getUserMedia would pick the camera's maximum (4K on phones).
+          const stream = await startLocalStream();
+          localStreamRef.current = stream;
+          console.log("[PeerTalks][MEDIA] local stream acquired", {
+            videoTracks: stream.getVideoTracks().length,
+            audioTracks: stream.getAudioTracks().length,
+          });
+        } catch (mediaError) {
+          const message = mediaErrorMessage(mediaError);
+          console.error("[PeerTalks][MEDIA] getUserMedia failed", {
+            name: mediaError instanceof DOMException ? mediaError.name : String(mediaError),
+          });
+          setMatchError(message);
+          setStatus("select");
+          matchingRef.current = false;
+          return;
+        }
+      } else {
+        console.log("[PeerTalks][MEDIA] text chat — no camera/mic requested");
+      }
 
       const channel = supabase
         .channel(`matching_update_${userId}`)
@@ -104,51 +166,93 @@ function RandomChatContent() {
           (payload: { new: Record<string, unknown> }) => {
             const newData = payload.new as Record<string, unknown>;
             if (newData && newData.status === "matched" && newData.session_id) {
-              console.log("[PeerTalks][Realtime] matched event", { sessionId: newData.session_id });
+              console.log("[PeerTalks][MATCH] realtime matched event", { sessionId: newData.session_id });
+              matchingRef.current = false;
               setStatus("connected");
               clearMatchingTimers();
+              releaseLocalMedia();
               setTimeout(() => router.push(`/chat/room/${newData.session_id}`), 500);
             }
           }
         )
-        .subscribe((status) => {
-          console.log("[PeerTalks][Realtime] channel status", { status });
+        .subscribe((subStatus) => {
+          console.log("[PeerTalks][MATCH] realtime channel status", { userId, status: subStatus });
         });
 
       subscriptionRef.current = channel;
 
       // One idempotency key for the whole attempt: re-polling with the same
       // key can never charge the user twice.
-      const requestKey = globalThis.crypto.randomUUID();
+      requestKeyRef.current = globalThis.crypto.randomUUID();
+
+      const abortWithError = (message: string) => {
+        console.error("[PeerTalks][MATCH] aborting with error", { message });
+        matchingRef.current = false;
+        clearMatchingTimers();
+        unsubscribeMatching();
+        releaseLocalMedia();
+        requestKeyRef.current = null;
+        // Remove any waiting queue row (and refund when one was removed) so
+        // a timed-out/failed attempt never strands tokens or queue entries.
+        fetch("/api/matching/random", { method: "DELETE" })
+          .then(async (res) => {
+            const body = (await res.json().catch(() => null)) as { balance?: number } | null;
+            if (body && typeof body.balance === "number") setBalance(body.balance);
+          })
+          .catch(() => {});
+        void refresh();
+        setMatchError(message);
+        setStatus("select");
+      };
 
       const attemptMatch = async (): Promise<boolean> => {
         const res = await fetch("/api/matching/random", {
           method: "POST",
           headers: {
             "x-call-type": callType,
-            "x-request-id": requestKey,
+            "x-request-id": requestKeyRef.current ?? "",
           },
         });
-        const data = await res.json();
-        if (typeof data.balance === "number") setBalance(data.balance);
+        const data = (await res.json().catch(() => null)) as
+          | { error?: string; reason?: string; balance?: number; matched?: boolean; sessionId?: string; queueId?: number }
+          | null;
+        if (typeof data?.balance === "number") setBalance(data.balance);
         void refresh();
 
-        if (!res.ok) {
-          console.warn("[PeerTalks][Match RPC] POST rejected", {
-            userId, status: res.status, body: data,
+        if (!res.ok || data?.error) {
+          console.warn("[PeerTalks][MATCH] POST rejected", {
+            userId, status: res.status, error: data?.error, reason: data?.reason,
           });
+          if (data?.reason === "matchmaking_unavailable") {
+            abortWithError(
+              data.error ??
+                "Matchmaking isn't ready yet. Check the database setup and try again in a moment."
+            );
+          } else if (data?.reason === "queue_insert_failed") {
+            abortWithError(data.error ?? "Could not join the matching queue. Please try again.");
+          } else if (res.status === 429) {
+            abortWithError("Too many requests. Wait a moment and try again.");
+          } else if (res.status === 400) {
+            abortWithError(data?.error ?? "You don't have enough tokens for this chat.");
+          } else {
+            abortWithError(data?.error ?? "Could not start matchmaking. Please try again.");
+          }
           return false;
         }
 
-        if (data.matched && data.sessionId) {
-          console.log("[PeerTalks][Session] matched via response", { sessionId: data.sessionId });
+        if (data?.matched && data.sessionId) {
+          console.log("[PeerTalks][SESSION] matched via response", { sessionId: data.sessionId });
+          matchingRef.current = false;
           setStatus("connected");
           clearMatchingTimers();
+          releaseLocalMedia();
           setTimeout(() => router.push(`/chat/room/${data.sessionId}`), 800);
           return true;
         }
 
-        console.log("[PeerTalks][Queue] waiting, no match yet", { userId });
+        console.log("[PeerTalks][QUEUE] waiting, no match yet", {
+          userId, queueId: data?.queueId ?? null,
+        });
         return false;
       };
 
@@ -166,18 +270,30 @@ function RandomChatContent() {
         const hit = await attemptMatch();
         if (hit) clearMatchingTimers();
       }, 4000);
+
+      // Never leave the user on "Finding someone" indefinitely.
+      timeoutTimerRef.current = setTimeout(() => {
+        if (!matchingRef.current) return;
+        abortWithError(
+          "Couldn't find a match this time. Please try again — both users need to be waiting at the same time."
+        );
+      }, MATCHING_TIMEOUT_MS);
     } catch {
       setMatchError("Something went wrong. Please try again.");
       setStatus("select");
       matchingRef.current = false;
       clearMatchingTimers();
+      releaseLocalMedia();
+      requestKeyRef.current = null;
     }
-  }, [router, unsubscribeMatching, refresh, setBalance, clearMatchingTimers]);
+  }, [router, unsubscribeMatching, refresh, setBalance, clearMatchingTimers, releaseLocalMedia]);
 
   const cancelMatching = useCallback(async () => {
     matchingRef.current = false;
     clearMatchingTimers();
     unsubscribeMatching();
+    releaseLocalMedia();
+    requestKeyRef.current = null;
     const res = await fetch("/api/matching/random", { method: "DELETE" }).catch(() => null);
     if (res) {
       const body = (await res.json().catch(() => null)) as { balance?: number } | null;
@@ -185,15 +301,16 @@ function RandomChatContent() {
     }
     await refresh();
     setStatus("select");
-  }, [unsubscribeMatching, refresh, setBalance, clearMatchingTimers]);
+  }, [unsubscribeMatching, refresh, setBalance, clearMatchingTimers, releaseLocalMedia]);
 
   useEffect(() => {
     return () => {
       unsubscribeMatching();
       clearMatchingTimers();
+      releaseLocalMedia();
       fetch("/api/matching/random", { method: "DELETE" }).catch(() => {});
     };
-  }, [unsubscribeMatching, clearMatchingTimers]);
+  }, [unsubscribeMatching, clearMatchingTimers, releaseLocalMedia]);
 
   return (
     <div className="min-h-screen flex items-center justify-center px-4 pt-16">

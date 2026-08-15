@@ -100,10 +100,18 @@ export function TokensProvider({ children }: { children: React.ReactNode }) {
     if (error) {
       console.error("[tokens] direct balance fetch error", { userId, message: error.message });
       setState((s) => ({ ...s, loading: false, error: error.message }));
+    } else if (data === null) {
+      // RLS-blocked or missing row: the read "succeeded" with no data. This
+      // must NOT be treated as balance 0 — the RPCs (claim/deduct) and the
+      // server route are authoritative and may have already applied a value.
+      console.warn("[tokens] direct balance read empty (RLS-blocked or no row); keeping prior balance", {
+        userId,
+      });
+      setState((s) => ({ ...s, loading: false }));
     } else {
-      console.log("[tokens] direct balance fetched", { userId, balance: data?.balance ?? 0 });
-      applyDisplay(data?.balance ?? 0, "db");
-      applied = data?.balance ?? 0;
+      console.log("[tokens] direct balance fetched", { userId, balance: data.balance });
+      applyDisplay(data.balance, "db");
+      applied = data.balance;
     }
     return applied;
   }, [applyDisplay]);

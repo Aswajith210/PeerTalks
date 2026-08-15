@@ -29,7 +29,7 @@ export async function POST(request: Request) {
     const result = await ensureDailyTokens(session.user.id, tz);
     return NextResponse.json({
       claimed: result.claimed,
-      balance: typeof result.balance === "number" ? result.balance : 0,
+      balance: typeof result.balance === "number" ? result.balance : null,
     });
   } catch {
     return NextResponse.json({ error: "Failed to claim daily tokens" }, { status: 500 });

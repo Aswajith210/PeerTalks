@@ -46,6 +46,13 @@ export function PremiumBackground() {
     };
 
     const animate = () => {
+      // While a video call is live the chat room sets
+      // document.body.dataset.peertalksInChat — skip painting entirely so
+      // the rAF loop never competes with WebRTC decode on mobile.
+      if (document.body?.dataset.peertalksInChat === "1") {
+        rafRef.current = requestAnimationFrame(animate);
+        return;
+      }
       ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
 
       for (const p of particlesRef.current) {

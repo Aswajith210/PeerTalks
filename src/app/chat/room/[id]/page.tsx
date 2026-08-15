@@ -42,6 +42,7 @@ function ChatRoomContent() {
   const [myUserId, setMyUserId] = useState<string | null>(null);
   const [clientReady, setClientReady] = useState(false);
   const [reactions, setReactions] = useState<Record<number, Record<string, { count: number; mine: boolean }>>>({});
+  const [peerLeftReason, setPeerLeftReason] = useState<string>("Your partner left");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const supabaseRef = useRef<SupabaseClient | null>(null);
@@ -49,9 +50,14 @@ function ChatRoomContent() {
   const inputRef = useRef<HTMLInputElement>(null);
   const msgChannelRef = useRef<RealtimeChannel | null>(null);
   const signalingChannelRef = useRef<RealtimeChannel | null>(null);
+  const sessionChannelRef = useRef<RealtimeChannel | null>(null);
+  const reactionsChannelRef = useRef<RealtimeChannel | null>(null);
   const userIdRef = useRef<string | null>(null);
   const peerIdRef = useRef<string | null>(null);
+  const sessionEndedRef = useRef(false);
   const offerTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const connectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const answerReceivedRef = useRef(false);
   const typingSentAtRef = useRef(0);
   const typingClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { reactionsRef, addReaction } = useReactions();
@@ -128,7 +134,14 @@ function ChatRoomContent() {
           setCallType(data.call_type ?? "video");
           const myId = userIdRef.current;
           if (myId) {
-            peerIdRef.current = data.user1_id === myId ? data.user2_id : data.user1_id;
+            // user1 is the room host (private rooms) or the first matched
+            // user — used for offerer determination so exactly ONE side
+            // creates the offer (no glare).
+            if (data.user1_id === myId) {
+              peerIdRef.current = data.user2_id;
+            } else {
+              peerIdRef.current = data.user1_id;
+            }
           }
           if (data.call_type === "text") {
             setJoined(true);
@@ -144,6 +157,78 @@ function ChatRoomContent() {
     loadSession();
     return () => { cancelled = true; };
   }, [id, clientReady, router, toast]);
+
+  // Live session state: guest assignment on private rooms (peer id becomes
+  // known late) and the peer ending the session. Without this the host
+  // never learns the guest's id, and an ended session keeps the other
+  // client on the call screen indefinitely.
+  useEffect(() => {
+    if (!callLoaded) return;
+    let cancelled = false;
+
+    const init = async () => {
+      const supabase = getSupabase();
+      if (!supabase || cancelled) return;
+
+      const channel = supabase
+        .channel(`chat_session_${id}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "UPDATE",
+            schema: "public",
+            table: "chat_sessions",
+            filter: `id=eq.${id}`,
+          },
+          (payload) => {
+            const row = payload.new as {
+              status?: string;
+              user1_id?: string | null;
+              user2_id?: string | null;
+            };
+            if (row.status === "ended") {
+              if (sessionEndedRef.current) return;
+              sessionEndedRef.current = true;
+              console.log("[PeerTalks][SESSION] peer ended session", { sessionId: id });
+              setPeerLeftReason("Your partner ended the chat");
+              setPeerLeft(true);
+              return;
+            }
+            // Peer became known after page load (private room host).
+            if (row.user2_id && !peerIdRef.current) {
+              const myId = userIdRef.current;
+              if (myId && row.user2_id !== myId) {
+                peerIdRef.current = row.user2_id;
+                console.log("[PeerTalks][SESSION] guest assigned, peerId known", {
+                  sessionId: id, peerId: row.user2_id,
+                });
+              }
+            }
+          }
+        )
+        .subscribe((status) => {
+          console.log("[PeerTalks][REALTIME] chat_sessions channel status", {
+            sessionId: id, status,
+          });
+        });
+
+      if (!cancelled) {
+        sessionChannelRef.current = channel;
+      } else {
+        supabase.removeChannel(channel);
+      }
+    };
+
+    init();
+
+    return () => {
+      cancelled = true;
+      if (sessionChannelRef.current && supabaseRef.current) {
+        supabaseRef.current.removeChannel(sessionChannelRef.current);
+        sessionChannelRef.current = null;
+      }
+    };
+  }, [id, callLoaded]);
 
   // Message history + realtime
   useEffect(() => {
@@ -203,10 +288,65 @@ function ChatRoomContent() {
         )
         .subscribe();
 
+      // Peer reactions only ever appeared after a reload — subscribe to
+      // message_reactions so both clients stay in sync live. No table
+      // filter is possible (reactions don't carry a session id); RLS keeps
+      // the payloads scoped to this session's participants.
+      const reactionsChannel = supabase
+        .channel(`message_reactions:${id}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "message_reactions",
+          },
+          (payload) => {
+            const row = payload.new as {
+              message_id?: number;
+              user_id?: string;
+              reaction?: string;
+            } | null;
+            const oldRow = payload.old as {
+              message_id?: number;
+              user_id?: string;
+              reaction?: string;
+            } | null;
+            const messageId = row?.message_id ?? oldRow?.message_id;
+            const reaction = row?.reaction ?? oldRow?.reaction;
+            if (messageId == null || !reaction) return;
+            const fromMe = (row?.user_id ?? oldRow?.user_id) === userIdRef.current;
+            // My own changes are already applied optimistically in
+            // toggleMessageReaction — skip them to avoid double counting.
+            if (fromMe) return;
+            setReactions((prev) => {
+              const next = structuredClone(prev);
+              const entries = next[messageId] ?? {};
+              const cur = entries[reaction];
+              if (payload.eventType === "INSERT") {
+                entries[reaction] = {
+                  count: (cur?.count ?? 0) + 1,
+                  mine: cur?.mine ?? false,
+                };
+              } else if (payload.eventType === "DELETE") {
+                if (cur) {
+                  cur.count -= 1;
+                  if (cur.count <= 0) delete entries[reaction];
+                }
+              }
+              if (Object.keys(entries).length === 0) delete next[messageId];
+              return next;
+            });
+          }
+        )
+        .subscribe();
+
       if (!cancelled) {
         msgChannelRef.current = channel;
+        reactionsChannelRef.current = reactionsChannel;
       } else {
         supabase.removeChannel(channel);
+        supabase.removeChannel(reactionsChannel);
       }
     };
 
@@ -217,6 +357,10 @@ function ChatRoomContent() {
       if (msgChannelRef.current && supabaseRef.current) {
         supabaseRef.current.removeChannel(msgChannelRef.current);
         msgChannelRef.current = null;
+      }
+      if (reactionsChannelRef.current && supabaseRef.current) {
+        supabaseRef.current.removeChannel(reactionsChannelRef.current);
+        reactionsChannelRef.current = null;
       }
     };
   }, [id, joined]);
@@ -257,7 +401,9 @@ function ChatRoomContent() {
       }
     };
 
-    if (callType === "video") startMedia();
+    // Gate on callLoaded: callType defaults to "video", so without this the
+    // camera briefly powers on even for text chats while the session loads.
+    if (callLoaded && callType === "video") startMedia();
 
     return () => {
       cancelled = true;
@@ -269,11 +415,37 @@ function ChatRoomContent() {
         clearInterval(offerTimerRef.current);
         offerTimerRef.current = null;
       }
+      if (connectTimerRef.current) {
+        clearTimeout(connectTimerRef.current);
+        connectTimerRef.current = null;
+      }
+      if (typingClearTimerRef.current) {
+        clearTimeout(typingClearTimerRef.current);
+        typingClearTimerRef.current = null;
+      }
       stopLocalStream(localStreamRef.current);
+      setRemoteStream((prev) => {
+        prev?.getTracks().forEach((t) => t.stop());
+        return null;
+      });
       pcRef.current?.close();
       pcRef.current = null;
     };
-  }, [callType]);
+  }, [callType, callLoaded]);
+
+  // Pause the app-wide animated background (PremiumBackground rAF loop)
+  // while a video call is live — it would otherwise compete with WebRTC
+  // video decode on mobile.
+  useEffect(() => {
+    if (callType === "video" && joined) {
+      document.body.dataset.peertalksInChat = "1";
+    } else {
+      delete document.body.dataset.peertalksInChat;
+    }
+    return () => {
+      delete document.body.dataset.peertalksInChat;
+    };
+  }, [callType, joined]);
 
   const handlePeerLeft = useCallback(() => {
     setPeerLeft(true);
@@ -286,6 +458,7 @@ function ChatRoomContent() {
     const channelName = `signaling:${id}`;
     if (signalingChannelRef.current) {
       supabase.removeChannel(signalingChannelRef.current);
+      signalingChannelRef.current = null;
     }
 
     const channel = supabase.channel(channelName);
@@ -340,10 +513,11 @@ function ChatRoomContent() {
         }
       } else if (signal.type === "answer") {
         try {
-          console.log("[PeerTalks][WebRTC] answer received");
+          console.log("[PeerTalks][WEBRTC] answer received");
           if (pc.signalingState !== "stable") {
             await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: signal.sdp! }));
           }
+          answerReceivedRef.current = true;
         } catch (e) {
           console.error("[signaling] Failed to handle answer:", e);
         }
@@ -372,9 +546,16 @@ function ChatRoomContent() {
     signalingChannelRef.current = channel;
 
     if (isOfferer) {
-      // Retry the offer until we get an answer (handles peers joining late)
+      // Retry the offer until we get an answer (handles peers joining late).
+      // The FIRST offer is often broadcast before the peer's channel is
+      // subscribed, and broadcast messages are never replayed — so unless we
+      // roll back and re-offer, a missed offer leaves both sides stuck at
+      // "Connecting..." forever.
       const sendOffer = async () => {
-        if (pc.connectionState === "connected") {
+        // The chat may have ended while the pre-offer wait was pending —
+        // never resurrect the retry loop on a closed/detached peer connection.
+        if (pcRef.current !== pc || pc.connectionState === "closed") return;
+        if (answerReceivedRef.current || pc.connectionState === "connected") {
           if (offerTimerRef.current) {
             clearInterval(offerTimerRef.current);
             offerTimerRef.current = null;
@@ -382,15 +563,18 @@ function ChatRoomContent() {
           return;
         }
         try {
+          if (pc.signalingState === "have-local-offer") {
+            await pc.setLocalDescription({ type: "rollback" }).catch(() => {});
+          }
           if (pc.signalingState !== "have-local-offer") {
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
-            await channel.send({
+            const ready = await channel.send({
               type: "broadcast",
               event: "signal",
               payload: { type: "offer", sdp: offer.sdp! },
-            });
-            console.log("[PeerTalks][WebRTC] offer sent");
+            }).then(() => true).catch(() => false);
+            console.log("[PeerTalks][WEBRTC] offer sent", { acceptedByRealtime: ready });
           }
         } catch (e) {
           console.error("[signaling] Failed to create/send offer:", e);
@@ -404,6 +588,10 @@ function ChatRoomContent() {
   }, [id, addReaction, reactionsRef, handlePeerLeft]);
 
   const handleJoin = useCallback(async () => {
+    // Guard against a double-click / double-invocation: a second
+    // RTCPeerConnection would orphan the first (never closed, both send
+    // media) and leak its signaling channel.
+    if (pcRef.current) return;
     setIsJoining(true);
     try {
       if (callType === "text") {
@@ -412,7 +600,12 @@ function ChatRoomContent() {
       }
 
       const stream = localStreamRef.current;
-      if (!stream) return;
+      if (!stream) {
+        setMediaError(
+          "Camera or microphone is unavailable. Allow permissions in your browser and try again."
+        );
+        return;
+      }
 
       const pc = new RTCPeerConnection({
         iceServers: [
@@ -422,10 +615,14 @@ function ChatRoomContent() {
       });
 
       pc.ontrack = (event) => {
+        console.log("[PeerTalks][WEBRTC] remote stream received", {
+          streams: event.streams.length, trackKind: event.track?.kind,
+        });
         if (event.streams[0]) setRemoteStream(event.streams[0]);
       };
 
       pc.oniceconnectionstatechange = () => {
+        console.log("[PeerTalks][WEBRTC] iceConnectionState:", pc.iceConnectionState);
         if (pc.iceConnectionState === "disconnected") {
           // Try to re-establish
           try {
@@ -436,26 +633,38 @@ function ChatRoomContent() {
 
       pc.onconnectionstatechange = () => {
         setConnectionState(pc.connectionState);
-        console.log("[PeerTalks][WebRTC] connection state", pc.connectionState);
+        console.log("[PeerTalks][WEBRTC] connectionState:", pc.connectionState);
         if (pc.connectionState === "connected") {
           setPeerLeft(false);
           if (offerTimerRef.current) {
             clearInterval(offerTimerRef.current);
             offerTimerRef.current = null;
           }
+          if (connectTimerRef.current) {
+            clearTimeout(connectTimerRef.current);
+            connectTimerRef.current = null;
+          }
         } else if (pc.connectionState === "failed") {
+          setPeerLeftReason("The connection to your partner was lost");
+          if (offerTimerRef.current) {
+            clearInterval(offerTimerRef.current);
+            offerTimerRef.current = null;
+          }
           handlePeerLeft();
         } else if (pc.connectionState === "disconnected") {
           // Give ICE restart a chance before declaring peer left
           setTimeout(() => {
             if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
+              setPeerLeftReason("The connection to your partner was lost");
               handlePeerLeft();
             }
           }, 6000);
         }
       };
 
-      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+      const tracks = stream.getTracks();
+      console.log("[PeerTalks][WEBRTC] local tracks:", tracks.map((t) => `${t.kind}:${t.readyState}`).join(", "));
+      tracks.forEach((track) => pc.addTrack(track, stream));
 
       pcRef.current = pc;
       setJoined(true);
@@ -463,14 +672,36 @@ function ChatRoomContent() {
       const supabase = getSupabase();
       if (!supabase) return;
 
-      const peerId = peerIdRef.current;
-      const isOfferer = peerId ? (userIdRef.current ?? "") > peerId : true;
+      const session = await supabase
+        .from("chat_sessions")
+        .select("user1_id")
+        .eq("id", id)
+        .maybeSingle();
+      // Exactly ONE offerer: the session's user1 (room host / first
+      // matched). Deriving this from the session — instead of a lexicographic
+      // comparison on peer ids — prevents glare when the host's peer id is
+      // unknown at join time (private rooms).
+      const isOfferer = (session?.data?.user1_id ?? null) === userIdRef.current;
+      console.log("[PeerTalks][WEBRTC] role determined", { isOfferer, sessionId: id });
 
       initiateSignaling(pc, isOfferer);
+
+      // If the peer never joins (e.g. the other user closed the tab), never
+      // stay on "Establishing secure connection..." forever.
+      connectTimerRef.current = setTimeout(() => {
+        if (
+          pcRef.current &&
+          pcRef.current.connectionState !== "connected" &&
+          !sessionEndedRef.current
+        ) {
+          setPeerLeftReason("Your partner couldn't be reached. They may have left or lost connection.");
+          setPeerLeft(true);
+        }
+      }, 45000);
     } finally {
       setIsJoining(false);
     }
-  }, [callType, initiateSignaling, handlePeerLeft]);
+  }, [callType, id, initiateSignaling, handlePeerLeft]);
 
   const cleanupChannels = useCallback(() => {
     const supabase = getSupabase();
@@ -483,14 +714,41 @@ function ChatRoomContent() {
         supabase.removeChannel(msgChannelRef.current);
         msgChannelRef.current = null;
       }
+      if (sessionChannelRef.current) {
+        supabase.removeChannel(sessionChannelRef.current);
+        sessionChannelRef.current = null;
+      }
+      if (reactionsChannelRef.current) {
+        supabase.removeChannel(reactionsChannelRef.current);
+        reactionsChannelRef.current = null;
+      }
     }
     if (offerTimerRef.current) {
       clearInterval(offerTimerRef.current);
       offerTimerRef.current = null;
     }
+    if (connectTimerRef.current) {
+      clearTimeout(connectTimerRef.current);
+      connectTimerRef.current = null;
+    }
+    if (typingClearTimerRef.current) {
+      clearTimeout(typingClearTimerRef.current);
+      typingClearTimerRef.current = null;
+    }
+  }, []);
+
+  // Purge this user's matching queue rows (waiting AND matched) for both
+  // modes — matched rows must never resurrect an old session during the
+  // next matching attempt. Only waiting rows ever refund, so this is safe
+  // to fire on every leave.
+  const purgeQueueRows = useCallback(() => {
+    const body = JSON.stringify({ cleanupMatched: true });
+    fetch("/api/matching/random", { method: "DELETE", body, headers: { "Content-Type": "application/json" } }).catch(() => {});
+    fetch("/api/matching/interest", { method: "DELETE", body, headers: { "Content-Type": "application/json" } }).catch(() => {});
   }, []);
 
   const endChat = useCallback(async (goTo: string = "/dashboard") => {
+    sessionEndedRef.current = true;
     if (signalingChannelRef.current) {
       signalingChannelRef.current.send({
         type: "broadcast",
@@ -509,8 +767,32 @@ function ChatRoomContent() {
     stopLocalStream(localStreamRef.current);
     pcRef.current?.close();
     pcRef.current = null;
+    setRemoteStream((prev) => {
+      prev?.getTracks().forEach((t) => t.stop());
+      return null;
+    });
+    purgeQueueRows();
     router.push(goTo);
-  }, [id, router, cleanupChannels]);
+  }, [id, router, cleanupChannels, purgeQueueRows]);
+
+  // Leaving the page without pressing "End chat" (back button, tab close)
+  // must still end the session and purge matching rows — otherwise a stale
+  // "connected" session and a matched queue row can resurrect on the next
+  // attempt, and the peer stays on the call screen forever.
+  useEffect(() => {
+    return () => {
+      if (sessionEndedRef.current) return;
+      sessionEndedRef.current = true;
+      if (id) {
+        fetch("/api/chat/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: id }),
+        }).catch(() => {});
+        purgeQueueRows();
+      }
+    };
+  }, [id, purgeQueueRows]);
 
   const nextUser = useCallback(() => {
     endChat("/chat/random");
@@ -531,11 +813,20 @@ function ChatRoomContent() {
 
     const s = getSupabase();
     if (!s) return;
-    await s.from("messages").insert({
+    const { data: { user } } = await s.auth.getUser();
+    if (!user) return;
+    const { error } = await s.from("messages").insert({
       session_id: id,
-      sender_id: (await s.auth.getSession()).data.session?.user.id,
+      sender_id: user.id,
       content,
     });
+    if (error) {
+      console.error("[PeerTalks][MESSAGES] insert failed", {
+        sessionId: id, message: error.message,
+      });
+      toast.error("Failed to send message");
+      setNewMessage(content);
+    }
   };
 
   const notifyTyping = () => {
@@ -831,7 +1122,7 @@ function ChatRoomContent() {
         </div>
 
         {showChat && (
-          <div className="fixed inset-0 z-30 sm:static sm:inset-auto sm:w-80 border-l border-white/5 bg-black/40 backdrop-blur-xl flex flex-col sm:relative">
+          <div className="fixed inset-0 z-30 sm:static sm:inset-auto sm:w-80 border-l border-white/5 bg-black/70 flex flex-col sm:relative">
             <div className="flex items-center justify-between p-4 border-b border-white/[0.04]">
               <span className="text-sm text-white/60 font-medium">Chat</span>
               <button
@@ -905,7 +1196,7 @@ function ChatRoomContent() {
       </div>
 
       {peerLeft && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80">
           <div className="glass-card rounded-3xl p-8 text-center max-w-sm mx-4">
             <div className="w-12 h-12 mx-auto rounded-full bg-white/[0.04] border border-white/[0.08] flex items-center justify-center mb-4">
               <svg className="w-6 h-6 text-white/30" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
@@ -914,8 +1205,8 @@ function ChatRoomContent() {
                 <path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" />
               </svg>
             </div>
-            <h2 className="text-lg font-semibold text-white/90 mb-2">Your partner left</h2>
-            <p className="text-sm text-muted mb-6">Find someone new to continue the conversation.</p>
+            <h2 className="text-lg font-semibold text-white/90 mb-2">Conversation ended</h2>
+            <p className="text-sm text-muted mb-6">{peerLeftReason}</p>
             <div className="flex flex-col gap-2">
               <button
                 onClick={nextUser}

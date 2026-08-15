@@ -1,5 +1,7 @@
 "use client";
 
+import { useEffect, useRef } from "react";
+
 interface VideoCardProps {
   stream: MediaStream | null;
   muted?: boolean;
@@ -17,17 +19,25 @@ export function VideoCard({
   isLoading,
   connectionState,
 }: VideoCardProps) {
-  const handleRef = (el: HTMLVideoElement | null) => {
-    if (el && stream) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  // Keyed on [stream]: clears srcObject when the stream goes away so the
+  // peer's last frame never stays frozen behind an overlay.
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el) return;
+    if (stream) {
       el.srcObject = stream;
+    } else {
+      el.srcObject = null;
     }
-  };
+  }, [stream]);
 
   return (
-    <div className="relative w-full h-full flex items-center justify-center overflow-hidden rounded-3xl bg-black/40 border border-white/[0.04] shadow-premium-lg">
+    <div className={`relative w-full h-full flex items-center justify-center overflow-hidden rounded-3xl bg-black/40 border border-white/[0.04] ${stream ? "" : "shadow-premium-lg"}`}>
       {stream ? (
         <video
-          ref={handleRef}
+          ref={videoRef}
           autoPlay
           playsInline
           muted={muted}

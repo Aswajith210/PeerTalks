@@ -25,7 +25,13 @@ export function FloatingPreview({ stream, audioEnabled, videoEnabled }: Floating
   }, [stream]);
 
   useEffect(() => {
+    // Throttle: mousemove fires on every pointer move; resetting the hide
+    // timer on each one churns the main thread during a call.
+    let lastReset = 0;
     const resetTimer = () => {
+      const now = Date.now();
+      if (now - lastReset < 500) return;
+      lastReset = now;
       setVisible(true);
       if (hideTimeout.current) clearTimeout(hideTimeout.current);
       hideTimeout.current = setTimeout(() => setVisible(false), 5000);

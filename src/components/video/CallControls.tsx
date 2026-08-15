@@ -72,8 +72,12 @@ export function CallControls({
   const inactivityRef = useRef(0);
 
   useEffect(() => {
+    // Throttle: only reset the hide timer when the last reset was >= 500ms
+    // ago instead of on every mousemove/touchstart.
     const resetTimer = () => {
-      inactivityRef.current = Date.now();
+      const now = Date.now();
+      if (now - inactivityRef.current < 500) return;
+      inactivityRef.current = now;
       setVisible(true);
       if (hideTimeout.current) clearTimeout(hideTimeout.current);
       hideTimeout.current = setTimeout(() => {

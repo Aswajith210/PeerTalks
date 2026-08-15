@@ -1,4 +1,5 @@
 import { createServerSupabaseClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/admin";
 import { deductTokens, refundTokens, parseRequestKey, refundKeyFor } from "@/lib/tokens";
 import { NextResponse } from "next/server";
 import bcrypt from "bcryptjs";
@@ -17,6 +18,17 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  // The room lookup MUST use the service-role client: private_rooms RLS only
+  // lets host/guest SELECT rows, so a prospective guest (guest_id is still
+  // null) would get zero rows and this route would 404 before ever checking
+  // the password. The anon client stays for everything user-scoped.
+  let admin;
+  try {
+    admin = createAdminClient();
+  } catch {
+    return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
+  }
+
   const requestKey = parseRequestKey(request);
   if (!requestKey) {
     return NextResponse.json({ error: "Missing or invalid idempotency key" }, { status: 400 });
@@ -29,8 +41,12 @@ export async function POST(request: Request) {
   }
 
   const { name, password } = body;
+  const callType = request.headers.get("x-call-type") ?? "video";
+  if (callType !== "video" && callType !== "text") {
+    return NextResponse.json({ error: "Invalid call type" }, { status: 400 });
+  }
 
-  const { data: roomRow } = await supabase
+  const { data: roomRow } = await admin
     .from("private_rooms")
     .select("id, name, password_hash, host_id, guest_id, is_active, created_at, ended_at")
     .eq("name", name)
@@ -79,6 +95,9 @@ export async function POST(request: Request) {
       { status: 400 }
     );
   }
+  console.log("[PeerTalks][TOKENS] room join deducted", {
+    userId: session.user.id, idempotent: deduction.idempotent, balance: deduction.balance,
+  });
 
   // Try RPC first (security definer bypasses RLS)
   const { data: joinResult, error: joinError } = await supabase
@@ -88,6 +107,13 @@ export async function POST(request: Request) {
     });
 
   if (!joinError && joinResult?.success) {
+    // The RPC (older signature) creates the session without a call_type
+    // when no waiting session exists — normalize it to the requested type.
+    await supabase
+      .from("chat_sessions")
+      .update({ call_type: callType })
+      .eq("id", joinResult.session_id)
+      .neq("call_type", callType);
     return NextResponse.json({
       room,
       session: { id: joinResult.session_id },
@@ -96,27 +122,35 @@ export async function POST(request: Request) {
   }
 
   // Failure after the 5-token charge — refund so the user only pays when
-  // the private session actually starts.
+  // the private session actually starts. Idempotent replays never refund
+  // (a replay of a committed join must not mint tokens).
+  const refundCharge = async () => {
+    if (!deduction.idempotent) {
+      await refundTokens(session.user.id, 5, undefined, refundKeyFor(requestKey));
+    }
+  };
+
   if (joinError) {
     if (joinError.code === "PGRST202") {
       // Function not deployed — fall through to direct updates below.
     } else {
-      await refundTokens(session.user.id, 5, undefined, refundKeyFor(requestKey));
+      await refundCharge();
       return NextResponse.json(
         { error: "Failed to join room" },
         { status: 500 }
       );
     }
   } else if (!joinResult?.success) {
-    await refundTokens(session.user.id, 5, undefined, refundKeyFor(requestKey));
+    await refundCharge();
     return NextResponse.json(
       { error: joinResult?.error ?? "Room not found or already full" },
       { status: 400 }
     );
   }
 
-  // Fallback: direct update
-  const { error: updateError } = await supabase
+  // Fallback: direct update (service-role client — the guest update and the
+  // session writes below are RLS-restricted to the host/participants).
+  const { error: updateError } = await admin
     .from("private_rooms")
     .update({ guest_id: session.user.id })
     .eq("id", room.id)
@@ -124,12 +158,12 @@ export async function POST(request: Request) {
     .is("guest_id", null);
 
   if (updateError) {
-    await refundTokens(session.user.id, 5, undefined, refundKeyFor(requestKey));
+    await refundCharge();
     return NextResponse.json({ error: "Failed to join room" }, { status: 500 });
   }
 
   // Find or create chat session
-  const { data: existingSession } = await supabase
+  const { data: existingSession } = await admin
     .from("chat_sessions")
     .select("id")
     .eq("room_id", room.id.toString())
@@ -139,18 +173,19 @@ export async function POST(request: Request) {
   let sessionId: string;
 
   if (existingSession) {
-    const { data: updated } = await supabase
+    const { data: updated } = await admin
       .from("chat_sessions")
-      .update({ status: "connected", user2_id: session.user.id })
+      .update({ status: "connected", user2_id: session.user.id, call_type: callType })
       .eq("id", existingSession.id)
       .select("id")
       .single();
     sessionId = updated?.id ?? existingSession.id;
   } else {
-    const { data: newSession } = await supabase
+    const { data: newSession } = await admin
       .from("chat_sessions")
       .insert({
         mode: "private_room", status: "connected",
+        call_type: callType,
         user1_id: room.host_id, user2_id: session.user.id,
         room_id: room.id.toString(),
       })
@@ -160,7 +195,7 @@ export async function POST(request: Request) {
   }
 
   if (!sessionId) {
-    await refundTokens(session.user.id, 5, undefined, refundKeyFor(requestKey));
+    await refundCharge();
     return NextResponse.json({ error: "Failed to create chat session" }, { status: 500 });
   }
 
