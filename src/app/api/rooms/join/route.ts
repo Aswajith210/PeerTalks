@@ -39,12 +39,17 @@ export async function POST(request: Request) {
   // host/guest SELECT rows, so a prospective guest (guest_id still null)
   // sees zero rows with the authenticated client — exactly the reason this
   // used to need the service-role key. The RPC does the same cross-user
-  // lookup under definer rights, so the user session suffices.
-  let { data: roomRow, error: lookupError } = await supabase.rpc("lookup_private_room", {
+  // lookup under definer rights AND verifies the bcrypt password inside
+  // Postgres (pgcrypto crypt), so the route needs no elevated key and the
+  // password_hash never leaves the database.
+  let { data: lookup, error: lookupError } = await supabase.rpc("lookup_private_room", {
     p_name: name,
+    p_password: password,
   });
 
   // RPC not deployed (PGRST202) — fall back to the service-role lookup.
+  // Same semantics: the admin client fetches the row, bcrypt.compare runs
+  // server-side in Node, and the hash is stripped before any response.
   if (lookupError?.code === "PGRST202") {
     let admin;
     try {
@@ -52,41 +57,47 @@ export async function POST(request: Request) {
     } catch {
       return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
     }
-    const lookup = await admin
+    const fallback = await admin
       .from("private_rooms")
       .select("id, name, password_hash, host_id, guest_id, is_active, created_at, ended_at")
       .eq("name", name)
       .eq("is_active", true)
       .single();
-    roomRow = lookup.data ?? null;
-    lookupError = lookup.error;
+    lookupError = fallback.error;
+    if (!fallback.error && fallback.data) {
+      const rr = fallback.data;
+      const passwordValid = await bcrypt.compare(password, rr.password_hash);
+      lookup = {
+        found: true,
+        password_valid: passwordValid,
+        room: {
+          id: rr.id,
+          name: rr.name,
+          host_id: rr.host_id,
+          guest_id: rr.guest_id,
+          is_active: rr.is_active,
+          created_at: rr.created_at,
+          ended_at: rr.ended_at,
+        },
+      };
+    } else {
+      lookup = null;
+    }
   }
 
   if (lookupError && lookupError.code !== "PGRST202") {
     return NextResponse.json({ error: "Failed to look up room" }, { status: 500 });
   }
 
-  // Never expose password_hash to the client — strip it before any return.
-  const room = roomRow
-    ? {
-        id: roomRow.id,
-        name: roomRow.name,
-        host_id: roomRow.host_id,
-        guest_id: roomRow.guest_id,
-        is_active: roomRow.is_active,
-        created_at: roomRow.created_at,
-        ended_at: roomRow.ended_at,
-      }
-    : null;
-
-  if (!room) {
+  if (!lookup?.found) {
     return NextResponse.json({ error: "Room not found" }, { status: 404 });
   }
 
-  const valid = await bcrypt.compare(password, roomRow!.password_hash);
-  if (!valid) {
+  if (!lookup.password_valid) {
     return NextResponse.json({ error: "Invalid password" }, { status: 403 });
   }
+
+  const room = lookup.room;
 
   if (room.guest_id) {
     return NextResponse.json({ error: "Room is full" }, { status: 400 });

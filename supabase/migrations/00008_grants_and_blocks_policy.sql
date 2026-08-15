@@ -14,17 +14,19 @@
 -- RPC-driven flows (matching, claim/deduct) keep working because
 -- the RPCs are SECURITY DEFINER — which masked the missing grants.
 --
--- SAFETY: every public table here has ROW LEVEL SECURITY enabled
--- with user-scoped policies, so granting DML to `authenticated`
--- restores Supabase's STANDARD defaults and changes nothing for
--- the anon role. Nothing is exposed that a policy doesn't allow.
+-- SCOPE: grants are added ONLY for the `authenticated` role (the
+-- application's real sessions). The `anon` role receives NO table
+-- grants here — the client does not read or write any public table
+-- without a signed-in session, and RLS stays enabled and effective
+-- on every table (each policy is user-scoped). Nothing is exposed
+-- that a policy does not already allow.
+--
 -- Safe to re-run.
 -- ============================================================
 
-grant usage on schema public to anon, authenticated, service_role;
+grant usage on schema public to authenticated, service_role;
 
 grant select, insert, update, delete on all tables in schema public to authenticated;
-grant select on all tables in schema public to anon;
 grant usage, select on all sequences in schema public to authenticated;
 
 -- The blocks upsert (POST /api/blocks) does insert ... on conflict
@@ -37,10 +39,11 @@ create policy "Users can update their own blocks"
   using (auth.uid() = blocker_id)
   with check (auth.uid() = blocker_id);
 
--- Re-assert the RPC execution guards (00004 already revokes these;
--- kept here so this file is self-contained if applied standalone).
+-- Re-assert the RPC execution guards (00004/00005/00006 already
+-- revoke these; kept here so this file is self-contained if applied
+-- standalone). Signatures match exactly what is deployed.
 revoke execute on function public.find_random_match(uuid, text) from anon;
 revoke execute on function public.find_interest_match(uuid, text[], text) from anon;
 revoke execute on function public.claim_daily_tokens(uuid, integer, text) from anon;
-revoke execute on function public.deduct_tokens(uuid, integer, text, text) from anon;
+revoke execute on function public.deduct_tokens(uuid, integer, text, text, text, text) from anon;
 revoke execute on function public.join_private_room_as_guest(uuid, uuid) from anon;

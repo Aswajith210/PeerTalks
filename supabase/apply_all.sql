@@ -369,6 +369,14 @@ create policy "Users can delete their own blocks"
   on public.blocks for delete
   using (auth.uid() = blocker_id);
 
+-- The blocks upsert (POST /api/blocks) does insert ... on conflict
+-- (blocker_id, blocked_id) do update — that needs an UPDATE policy.
+drop policy if exists "Users can update their own blocks" on public.blocks;
+create policy "Users can update their own blocks"
+  on public.blocks for update
+  using (auth.uid() = blocker_id)
+  with check (auth.uid() = blocker_id);
+
 create index if not exists idx_blocks_blocker on public.blocks(blocker_id);
 create index if not exists idx_blocks_blocked on public.blocks(blocked_id);
 
@@ -870,6 +878,69 @@ end;
 $$;
 
 -- ----------------------------------------------------------------------------
+-- 17b. PRIVATE-ROOM LOOKUP RPC (00009) — removes the service-role
+--      dependency from room join. Verifies the bcrypt password inside
+--      Postgres (pgcrypto crypt) and NEVER returns password_hash.
+-- ----------------------------------------------------------------------------
+create or replace function public.lookup_private_room(
+  p_name text,
+  p_password text
+) returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_row    record;
+  v_valid  boolean;
+begin
+  if p_name is null or p_name = '' or p_password is null
+     or auth.uid() is null then
+    return null;
+  end if;
+
+  select id, name, password_hash, host_id, guest_id, is_active, created_at, ended_at
+    into v_row
+    from public.private_rooms
+    where name = p_name
+      and is_active = true;
+
+  if not found then
+    return null;
+  end if;
+
+  begin
+    v_valid := extensions.crypt(p_password, v_row.password_hash) = v_row.password_hash;
+  exception when others then
+    v_valid := false;
+  end;
+
+  return jsonb_build_object(
+    'found', true,
+    'password_valid', v_valid,
+    'room', jsonb_build_object(
+      'id', v_row.id,
+      'name', v_row.name,
+      'host_id', v_row.host_id,
+      'guest_id', v_row.guest_id,
+      'is_active', v_row.is_active,
+      'created_at', v_row.created_at,
+      'ended_at', v_row.ended_at
+    )
+  );
+end;
+$$;
+
+-- ----------------------------------------------------------------------------
+-- 17c. GRANTS (00008) — restore the authenticated-role table grants the
+--      production DB is missing. `anon` gets NO table grants: the client
+--      never reads/writes a public table without a signed-in session.
+-- ----------------------------------------------------------------------------
+grant usage on schema public to authenticated, service_role;
+grant select, insert, update, delete on all tables in schema public to authenticated;
+grant usage, select on all sequences in schema public to authenticated;
+
+-- ----------------------------------------------------------------------------
 -- 18. SECURITY — none of these may ever run as the `anon` role.
 -- ----------------------------------------------------------------------------
 revoke execute on function public.claim_daily_tokens(uuid, integer, text) from anon;
@@ -877,3 +948,4 @@ revoke execute on function public.deduct_tokens(uuid, integer, text, text, text,
 revoke execute on function public.find_random_match(uuid, text) from anon;
 revoke execute on function public.find_interest_match(uuid, text[], text) from anon;
 revoke execute on function public.join_private_room_as_guest(uuid, uuid) from anon;
+revoke execute on function public.lookup_private_room(text, text) from anon;
