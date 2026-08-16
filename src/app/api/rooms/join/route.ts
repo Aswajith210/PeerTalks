@@ -11,10 +11,10 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
   }
   const {
-    data: { session },
-  } = await supabase.auth.getSession();
+    data: { user },
+  } = await supabase.auth.getUser();
 
-  if (!session) {
+  if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -104,7 +104,7 @@ export async function POST(request: Request) {
   }
 
   const deduction = await deductTokens(
-    session.user.id,
+    user.id,
     5,
     "Private room",
     undefined,
@@ -112,7 +112,7 @@ export async function POST(request: Request) {
   );
   if (!deduction.success) {
     console.error("[tokens] room join blocked", {
-      userId: session.user.id, cost: 5, balance: deduction.balance, reason: deduction.reason,
+      userId: user.id, cost: 5, balance: deduction.balance, reason: deduction.reason,
     });
     return NextResponse.json(
       { error: "Insufficient tokens", balance: deduction.balance, reason: deduction.reason },
@@ -120,14 +120,14 @@ export async function POST(request: Request) {
     );
   }
   console.log("[PeerTalks][TOKENS] room join deducted", {
-    userId: session.user.id, idempotent: deduction.idempotent, balance: deduction.balance,
+    userId: user.id, idempotent: deduction.idempotent, balance: deduction.balance,
   });
 
   // Try RPC first (security definer bypasses RLS)
   const { data: joinResult, error: joinError } = await supabase
     .rpc("join_private_room_as_guest", {
       p_room_id: room.id,
-      p_guest_id: session.user.id,
+      p_guest_id: user.id,
     });
 
   if (!joinError && joinResult?.success) {
@@ -150,7 +150,7 @@ export async function POST(request: Request) {
   // (a replay of a committed join must not mint tokens).
   const refundCharge = async () => {
     if (!deduction.idempotent) {
-      await refundTokens(session.user.id, 5, undefined, refundKeyFor(requestKey));
+      await refundTokens(user.id, 5, undefined, refundKeyFor(requestKey));
     }
   };
 
@@ -193,7 +193,7 @@ export async function POST(request: Request) {
 
   const { data: assigned, error: updateError } = await admin
     .from("private_rooms")
-    .update({ guest_id: session.user.id })
+    .update({ guest_id: user.id })
     .eq("id", room.id)
     .eq("is_active", true)
     .is("guest_id", null)
@@ -223,7 +223,7 @@ export async function POST(request: Request) {
   if (existingSession) {
     const { data: updated } = await admin
       .from("chat_sessions")
-      .update({ status: "connected", user2_id: session.user.id, call_type: callType })
+      .update({ status: "connected", user2_id: user.id, call_type: callType })
       .eq("id", existingSession.id)
       .select("id")
       .single();
@@ -234,7 +234,7 @@ export async function POST(request: Request) {
       .insert({
         mode: "private_room", status: "connected",
         call_type: callType,
-        user1_id: room.host_id, user2_id: session.user.id,
+        user1_id: room.host_id, user2_id: user.id,
         room_id: room.id.toString(),
       })
       .select("id")

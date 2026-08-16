@@ -17,17 +17,17 @@ export async function GET() {
     return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
   }
   const {
-    data: { session },
-  } = await supabase.auth.getSession();
+    data: { user },
+  } = await supabase.auth.getUser();
 
-  if (!session) {
+  if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   const { data } = await supabase
     .from("profiles")
     .select("display_name, bio")
-    .eq("id", session.user.id)
+    .eq("id", user.id)
     .maybeSingle();
 
   return NextResponse.json({ profile: data ?? null });
@@ -39,10 +39,10 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
   }
   const {
-    data: { session },
-  } = await supabase.auth.getSession();
+    data: { user },
+  } = await supabase.auth.getUser();
 
-  if (!session) {
+  if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -58,7 +58,7 @@ export async function POST(request: Request) {
     .from("profiles")
     .upsert(
       {
-        id: session.user.id,
+        id: user.id,
         display_name: displayName.trim(),
         bio: bio.trim(),
       },

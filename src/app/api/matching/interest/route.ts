@@ -135,8 +135,8 @@ async function tryDirectMatch(
 export async function POST(request: Request) {
   const supabase = await createServerSupabaseClient();
   if (!supabase) return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
-  const { data: { session } } = await supabase.auth.getSession();
-  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const requestKey = parseRequestKey(request);
   if (!requestKey) {
@@ -153,7 +153,7 @@ export async function POST(request: Request) {
   }
 
   const { interests: rawInterests } = body;
-  const userId = session.user.id;
+  const userId = user.id;
   console.log("[PeerTalks][Auth] interest POST", { userId });
 
   // Per-item validation: a non-string item (e.g. a number) would throw in
@@ -335,9 +335,9 @@ export async function POST(request: Request) {
 export async function DELETE(request: Request) {
   const supabase = await createServerSupabaseClient();
   if (!supabase) return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
-  const { data: { session } } = await supabase.auth.getSession();
-  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  console.log("[PeerTalks][Auth] interest DELETE", { userId: session.user.id });
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  console.log("[PeerTalks][Auth] interest DELETE", { userId: user.id });
 
   // The attempt's idempotency key — the refund derives `refund:<key>` so a
   // duplicated DELETE can never refund the same charge twice (see random).
@@ -353,14 +353,14 @@ export async function DELETE(request: Request) {
   const { data: deleted } = await supabase
     .from("matching_queue")
     .delete({ count: "exact" })
-    .eq("user_id", session.user.id)
+    .eq("user_id", user.id)
     .eq("mode", "interest")
     .eq("status", "waiting")
     .select("id");
 
   if (deleted && deleted.length > 0) {
     const refund = await refundTokens(
-      session.user.id,
+      user.id,
       TOKEN_COSTS.VIDEO_CHAT,
       undefined,
       requestKey ? refundKeyFor(requestKey) : undefined
@@ -369,7 +369,7 @@ export async function DELETE(request: Request) {
       await supabase
         .from("matching_queue")
         .delete()
-        .eq("user_id", session.user.id)
+        .eq("user_id", user.id)
         .eq("mode", "interest")
         .eq("status", "matched");
     }
@@ -380,10 +380,10 @@ export async function DELETE(request: Request) {
     await supabase
       .from("matching_queue")
       .delete()
-      .eq("user_id", session.user.id)
+      .eq("user_id", user.id)
       .eq("mode", "interest")
       .eq("status", "matched");
-    console.log("[PeerTalks][Queue] purged matched rows", { userId: session.user.id });
+    console.log("[PeerTalks][Queue] purged matched rows", { userId: user.id });
   }
 
   return NextResponse.json({ success: true, refunded: false });

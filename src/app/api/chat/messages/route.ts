@@ -15,10 +15,10 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
   }
   const {
-    data: { session },
-  } = await supabase.auth.getSession();
+    data: { user },
+  } = await supabase.auth.getUser();
 
-  if (!session) {
+  if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -26,7 +26,8 @@ export async function GET(request: Request) {
     .from("messages")
     .select("*")
     .eq("session_id", sessionId)
-    .order("created_at", { ascending: true });
+    .order("created_at", { ascending: true })
+    .limit(200);
 
   return NextResponse.json(data ?? []);
 }
@@ -37,10 +38,10 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
   }
   const {
-    data: { session },
-  } = await supabase.auth.getSession();
+    data: { user },
+  } = await supabase.auth.getUser();
 
-  if (!session) {
+  if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -56,7 +57,7 @@ export async function POST(request: Request) {
     .from("messages")
     .insert({
       session_id: sessionId,
-      sender_id: session.user.id,
+      sender_id: user.id,
       content,
     })
     .select()

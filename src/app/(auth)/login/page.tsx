@@ -3,6 +3,39 @@
 import { LoginButton } from "@/components/auth/LoginButton";
 import { OAuthCodeCapture } from "@/components/auth/OAuthCodeCapture";
 import Link from "next/link";
+import { Suspense, useMemo } from "react";
+import { useSearchParams } from "next/navigation";
+
+function LoginError() {
+  const params = useSearchParams();
+  const error = params.get("error");
+  const message = useMemo(() => {
+    if (!error) return null;
+    if (/verifier|flow state|flow_state|invalid flow/i.test(error)) {
+      return "This sign-in link has already been used or expired. Please try again.";
+    }
+    if (error === "missing_code") {
+      return "The sign-in request was incomplete. Please try again.";
+    }
+    if (error === "missing_config") {
+      return "Sign-in is temporarily unavailable. Please try again later.";
+    }
+    return "Something went wrong while signing in. Please try again.";
+  }, [error]);
+  if (!message) return null;
+  return (
+    <div
+      role="alert"
+      className="mb-6 flex items-start gap-3 rounded-xl border border-red-400/20 bg-red-400/10 px-4 py-3 text-left"
+    >
+      <svg className="w-4 h-4 mt-0.5 shrink-0 text-red-300/80" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
+        <circle cx="12" cy="12" r="10" />
+        <path d="M12 8v4m0 4h.01" strokeLinecap="round" />
+      </svg>
+      <p className="text-sm text-red-200/80 font-light leading-relaxed">{message}</p>
+    </div>
+  );
+}
 
 export default function LoginPage() {
   return (
@@ -23,6 +56,9 @@ export default function LoginPage() {
           <p className="text-sm text-muted mb-6 leading-relaxed">
             Sign in to continue connecting with people around the world.
           </p>
+          <Suspense fallback={null}>
+            <LoginError />
+          </Suspense>
           <div className="w-full">
             <LoginButton />
           </div>

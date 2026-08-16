@@ -4,7 +4,7 @@ export const dynamic = "force-dynamic";
 
 import { AuthGuard } from "@/components/auth/AuthGuard";
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useState, useRef, useCallback, memo } from "react";
 import { createClient } from "@/lib/supabase/client";
 import type { Message } from "@/types/database";
 import type { SupabaseClient, RealtimeChannel } from "@supabase/supabase-js";
@@ -88,6 +88,19 @@ function ChatRoomContent() {
   const isOffererRef = useRef(false);
   const startOfferLoopRef = useRef<(() => void) | null>(null);
 
+  // Signaling hardening: Supabase Realtime dispatches incoming broadcast
+  // messages CONCURRENTLY, while offer/answer processing is async. A trickle
+  // ICE candidate can therefore be handled while remoteDescription is still
+  // null — addIceCandidate() THROWS in that state and the candidate is
+  // permanently lost (same-network devices gather in ms and hit this window
+  // constantly; STUN srflx candidates on cross-network links arrive later
+  // and survive — the exact "same Wi-Fi fails more than mobile data" pattern).
+  // Fix: serialize signal handling and queue candidates until a remote
+  // description exists, flushing them right after it is applied.
+  const signalQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const seenCandidatesRef = useRef<Set<string>>(new Set());
+
   const setCallStateSafe = useCallback((s: CallState) => {
     callStateRef.current = s;
     setCallState(s);
@@ -107,6 +120,80 @@ function ChatRoomContent() {
   }, []);
 
   const getSupabase = () => supabaseRef.current;
+
+  // Latest-value ref so the stable toggleMessageReaction callback never
+  // depends on the reactions state object (keeps MessageBubble memoizable).
+  const messageReactionsRef = useRef<Record<number, Record<string, { count: number; mine: boolean }>>>({});
+  useEffect(() => {
+    messageReactionsRef.current = reactions;
+  }, [reactions]);
+
+  const triggerOverlay = useCallback(() => {
+    setOverlayReactions([...reactionsRef.current]);
+    setTimeout(() => {
+      setOverlayReactions([...reactionsRef.current]);
+    }, 100);
+  }, [reactionsRef]);
+
+  // Serialize signal processing per channel: offer → answer → candidates are
+  // handled strictly in arrival order, so a candidate can never race the
+  // setRemoteDescription() it depends on.
+  const enqueueSignal = useCallback((task: () => Promise<void>) => {
+    signalQueueRef.current = signalQueueRef.current
+      .then(task)
+      .catch((e) => {
+        console.error(
+          "[PeerTalks][SIGNALING] signal handler error",
+          e instanceof Error ? e.message : String(e)
+        );
+      });
+  }, []);
+
+  const candidateKey = (c: RTCIceCandidateInit) =>
+    `${c.sdpMid ?? ""}|${c.sdpMLineIndex ?? -1}|${c.candidate ?? ""}`;
+
+  // Never lose a candidate to a missing remoteDescription: add immediately
+  // when possible, otherwise queue until the offer/answer lands.
+  const enqueueCandidate = useCallback((candidate: RTCIceCandidateInit, pc: RTCPeerConnection) => {
+    const key = candidateKey(candidate);
+    if (seenCandidatesRef.current.has(key)) return;
+    seenCandidatesRef.current.add(key);
+    if (pc.remoteDescription) {
+      pc.addIceCandidate(new RTCIceCandidate(candidate)).catch((e) => {
+        console.warn("[PeerTalks][ICE] candidate rejected", {
+          reason: e instanceof Error ? e.message : String(e),
+        });
+      });
+      return;
+    }
+    pendingCandidatesRef.current.push(candidate);
+    console.log("[PeerTalks][ICE] candidate queued until remoteDescription is set", {
+      queued: pendingCandidatesRef.current.length,
+    });
+  }, []);
+
+  const flushQueuedCandidates = useCallback((pc: RTCPeerConnection) => {
+    if (!pc.remoteDescription) return;
+    const queued = pendingCandidatesRef.current;
+    if (queued.length === 0) return;
+    pendingCandidatesRef.current = [];
+    queued.forEach((c) => {
+      pc.addIceCandidate(new RTCIceCandidate(c)).catch((e) => {
+        console.warn("[PeerTalks][ICE] queued candidate rejected", {
+          reason: e instanceof Error ? e.message : String(e),
+        });
+      });
+    });
+    console.log("[PeerTalks][ICE] flushed queued candidates", { count: queued.length });
+  }, []);
+
+  // A new ICE generation starts when a remote description is applied (or a
+  // fresh local offer is created). Old-generation candidates are invalid for
+  // it, so drop the queue and the dedupe set before creating a new offer.
+  const resetCandidateState = useCallback(() => {
+    pendingCandidatesRef.current = [];
+    seenCandidatesRef.current.clear();
+  }, []);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -287,7 +374,8 @@ function ChatRoomContent() {
         .from("messages")
         .select("*")
         .eq("session_id", id)
-        .order("created_at", { ascending: true });
+        .order("created_at", { ascending: true })
+        .limit(200);
       if (!cancelled) setMessages(msgs ?? []);
 
       // Load reactions for existing messages
@@ -557,9 +645,14 @@ function ChatRoomContent() {
     setCallStateSafe("reconnecting");
     // Restart ICE (triggers negotiationneeded) and, on the offerer side,
     // resume the offer retry loop so the recovery offer is actually sent.
-    try {
-      pc.restartIce();
-    } catch {}
+    // Only restart when the negotiation state is stable — a restart during
+    // an in-flight negotiation is dropped by the browser and would stall the
+    // recovery that is already happening.
+    if (pc.signalingState === "stable") {
+      try {
+        pc.restartIce();
+      } catch {}
+    }
     answerReceivedRef.current = false;
     if (isOffererRef.current) {
       startOfferLoopRef.current?.();
@@ -610,10 +703,7 @@ function ChatRoomContent() {
       // session id can subscribe. Only accept events from the actual peer.
       if (senderId && peerIdRef.current && senderId !== peerIdRef.current) return;
       addReaction(type);
-      setOverlayReactions([...reactionsRef.current]);
-      setTimeout(() => {
-        setOverlayReactions([...reactionsRef.current]);
-      }, 100);
+      triggerOverlay();
     });
 
     channel.on("broadcast", { event: "typing" }, (payload) => {
@@ -633,7 +723,7 @@ function ChatRoomContent() {
       handlePeerLeft();
     });
 
-    channel.on("broadcast", { event: "signal" }, async (payload) => {
+    channel.on("broadcast", { event: "signal" }, (payload) => {
       const signal = payload.payload as {
         type: string; sdp?: string; candidate?: RTCIceCandidateInit; senderId?: string;
       };
@@ -644,46 +734,71 @@ function ChatRoomContent() {
       if (signal.senderId && peerIdRef.current && signal.senderId !== peerIdRef.current) {
         return;
       }
-      if (signal.type === "offer") {
-        console.log("[PeerTalks][WEBRTC] offer received", { signalingState: pc.signalingState });
-        try {
-          if (pc.signalingState !== "have-local-offer") {
-            await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: signal.sdp! }));
-          } else {
-            // Glare — we made an offer first; treat ours as invalid
-            pc.setLocalDescription({ type: "rollback" }).catch(() => {});
-            await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: signal.sdp! }));
-          }
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          console.log("[PeerTalks][WebRTC] answer sent");
-          await channel.send({
-            type: "broadcast",
-            event: "signal",
-            payload: { type: "answer", sdp: answer.sdp!, senderId: userIdRef.current },
+      // Serialized: offer/answer/candidate messages are processed strictly in
+      // arrival order, so candidates can never race setRemoteDescription().
+      enqueueSignal(async () => {
+        if (sessionEndedRef.current || pc.connectionState === "closed") return;
+        if (signal.type === "offer") {
+          console.log("[PeerTalks][WEBRTC] offer received", {
+            signalingState: pc.signalingState, hasRemoteDescription: !!pc.remoteDescription,
           });
-        } catch (e) {
-          console.error("[signaling] Failed to handle offer:", e);
-        }
-      } else if (signal.type === "answer") {
-        try {
-          console.log("[PeerTalks][WEBRTC] answer received", { signalingState: pc.signalingState });
-          if (pc.signalingState !== "stable") {
-            await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: signal.sdp! }));
+          try {
+            if (pc.signalingState === "have-local-offer") {
+              // Glare — we made an offer first; treat ours as invalid
+              try {
+                await pc.setLocalDescription({ type: "rollback" });
+              } catch {}
+              await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: signal.sdp! }));
+            } else {
+              await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: signal.sdp! }));
+            }
+            // New generation: candidates queued before the offer belong to it.
+            flushQueuedCandidates(pc);
+            seenCandidatesRef.current.clear();
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            console.log("[PeerTalks][SIGNALING] answer sent", {
+              signalingState: pc.signalingState,
+            });
+            await channel.send({
+              type: "broadcast",
+              event: "signal",
+              payload: { type: "answer", sdp: answer.sdp!, senderId: userIdRef.current },
+            });
+          } catch (e) {
+            console.error("[PeerTalks][SIGNALING] failed to handle offer", e);
           }
-          answerReceivedRef.current = true;
-        } catch (e) {
-          console.error("[signaling] Failed to handle answer:", e);
-        }
-      } else if (signal.type === "ice-candidate") {
-        try {
+        } else if (signal.type === "answer") {
+          console.log("[PeerTalks][SIGNALING] answer received", {
+            signalingState: pc.signalingState, hasRemoteDescription: !!pc.remoteDescription,
+          });
+          try {
+            if (pc.signalingState !== "stable") {
+              await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: signal.sdp! }));
+              answerReceivedRef.current = true;
+              // Candidates the answerer gathered while its answer was in
+              // flight may have arrived here first — apply them now.
+              flushQueuedCandidates(pc);
+              seenCandidatesRef.current.clear();
+            } else if (!pc.remoteDescription) {
+              // Our offer was rolled back by the retry loop before this
+              // answer landed — it targets a dead offer. Do NOT mark the
+              // exchange answered; the loop re-offers and the peer re-answers.
+              console.log("[PeerTalks][SIGNALING] answer for rolled-back offer - will re-offer");
+              answerReceivedRef.current = false;
+            } else {
+              // Duplicate answer for an already-applied offer — ignore.
+              answerReceivedRef.current = true;
+            }
+          } catch (e) {
+            console.error("[PeerTalks][SIGNALING] failed to handle answer", e);
+          }
+        } else if (signal.type === "ice-candidate") {
           if (signal.candidate) {
-            await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+            enqueueCandidate(signal.candidate, pc);
           }
-        } catch (e) {
-          console.error("[signaling] Failed to add ICE candidate:", e);
         }
-      }
+      });
     });
 
     pc.onicecandidate = (event) => {
@@ -702,7 +817,9 @@ function ChatRoomContent() {
       }
     };
 
-    await channel.subscribe();
+    await channel.subscribe((status) => {
+      console.log("[PeerTalks][SIGNALING] channel status", { sessionId: id, status });
+    });
     // The chat may have ended while the channel was connecting — never
     // register a channel or start the offer loop after cleanup ran.
     if (sessionEndedRef.current) {
@@ -710,30 +827,6 @@ function ChatRoomContent() {
       return;
     }
     signalingChannelRef.current = channel;
-
-    // Recovery path: when restartIce() (or a transceiver change) flags that
-    // the connection needs renegotiation, this handler actually broadcasts
-    // the new offer. Without it a restarted ICE never leaves this client and
-    // the call stays stuck in "disconnected" until the grace timer kills it.
-    // Gated to the reconnecting phase so it never duplicates the offerer's
-    // initial offer loop.
-    pc.onnegotiationneeded = async () => {
-      if (sessionEndedRef.current || pc.connectionState === "closed") return;
-      if (callStateRef.current !== "reconnecting") return;
-      if (pc.signalingState !== "stable") return;
-      try {
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        await channel.send({
-          type: "broadcast",
-          event: "signal",
-          payload: { type: "offer", sdp: offer.sdp!, senderId: userIdRef.current },
-        });
-        console.log("[PeerTalks][SIGNALING] recovery offer sent", { signalingState: pc.signalingState });
-      } catch (e) {
-        console.error("[PeerTalks][SIGNALING] recovery offer failed", e);
-      }
-    };
 
     if (isOfferer) {
       // Retry the offer until we get an answer (handles peers joining late).
@@ -754,9 +847,27 @@ function ChatRoomContent() {
         }
         try {
           if (pc.signalingState === "have-local-offer") {
-            await pc.setLocalDescription({ type: "rollback" }).catch(() => {});
+            // Re-broadcast the SAME offer instead of rolling back and
+            // creating a fresh one: after a rollback Chromium can reorder
+            // m-lines, and the answerer's setRemoteDescription throws
+            // (InvalidAccessError) on the mismatch — the ICE generation
+            // diverges and the call dies. Re-sending identical SDP is
+            // idempotent: the answerer re-answers and we converge.
+            const pending = pc.localDescription?.sdp;
+            if (!pending) return;
+            const ready = await channel.send({
+              type: "broadcast",
+              event: "signal",
+              payload: { type: "offer", sdp: pending, senderId: userIdRef.current },
+            }).then(() => true).catch(() => false);
+            console.log("[PeerTalks][WEBRTC] offer re-sent", { acceptedByRealtime: ready });
+            return;
           }
-          if (pc.signalingState !== "have-local-offer") {
+          if (pc.signalingState === "stable" && !pc.remoteDescription) {
+            // Nothing on the wire yet (first tick) — create the offer once.
+            // New local offer = new ICE generation; old queued/seen
+            // candidates are invalid for it.
+            resetCandidateState();
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
             const ready = await channel.send({
@@ -766,8 +877,10 @@ function ChatRoomContent() {
             }).then(() => true).catch(() => false);
             console.log("[PeerTalks][WEBRTC] offer sent", { acceptedByRealtime: ready });
           }
+          // Otherwise (glare handled by the offer branch, answer applied,
+          // or renegotiation in flight) — skip this tick.
         } catch (e) {
-          console.error("[signaling] Failed to create/send offer:", e);
+          console.error("[PeerTalks][SIGNALING] failed to create/send offer", e);
         }
       };
 
@@ -780,7 +893,7 @@ function ChatRoomContent() {
       };
       startOfferLoopRef.current();
     }
-  }, [id, addReaction, reactionsRef, handlePeerLeft]);
+  }, [id, addReaction, handlePeerLeft, enqueueSignal, enqueueCandidate, flushQueuedCandidates, resetCandidateState, triggerOverlay]);
 
   const handleJoin = useCallback(async () => {
     // Guard against a double-click / double-invocation: a second
@@ -809,6 +922,37 @@ function ChatRoomContent() {
         ],
       });
       console.log("[PeerTalks][WEBRTC] pc created", { sessionId: id, userId: userIdRef.current });
+
+      // Recovery path: when restartIce() flags that the connection needs
+      // renegotiation, this handler actually broadcasts the new offer.
+      // Without it a restarted ICE never leaves this client and the call
+      // stays stuck in "disconnected" until the grace timer kills it.
+      // Attached IMMEDIATELY (before the channel subscribes) so a restart
+      // during subscription can never lose its negotiationneeded event.
+      // Gated to the reconnecting phase so it never duplicates the offerer's
+      // initial offer loop.
+      pc.onnegotiationneeded = async () => {
+        if (sessionEndedRef.current || pc.connectionState === "closed") return;
+        if (callStateRef.current !== "reconnecting") return;
+        if (pc.signalingState !== "stable") return;
+        const ch = signalingChannelRef.current;
+        if (!ch || ch.state !== "joined") return;
+        try {
+          resetCandidateState();
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          await ch.send({
+            type: "broadcast",
+            event: "signal",
+            payload: { type: "offer", sdp: offer.sdp!, senderId: userIdRef.current },
+          });
+          console.log("[PeerTalks][SIGNALING] recovery offer sent", {
+            signalingState: pc.signalingState,
+          });
+        } catch (e) {
+          console.error("[PeerTalks][SIGNALING] recovery offer failed", e);
+        }
+      };
 
       // Tracks the remote media stream across ontrack events. Some browsers
       // (WebKit/Safari) fire ontrack with an empty `streams` array, or
@@ -874,13 +1018,11 @@ function ChatRoomContent() {
       };
 
       pc.oniceconnectionstatechange = () => {
+        // NO restartIce() here: enterReconnecting() (from
+        // onconnectionstatechange) owns the single recovery path. Restarting
+        // from BOTH places on every transient "disconnected" churns ICE
+        // generations on mobile blips.
         console.log("[PeerTalks][ICE] iceConnectionState:", pc.iceConnectionState);
-        if (pc.iceConnectionState === "disconnected") {
-          // Try to re-establish
-          try {
-            pc.restartIce();
-          } catch {}
-        }
       };
       pc.onicegatheringstatechange = () => {
         console.log("[PeerTalks][ICE] iceGatheringState:", pc.iceGatheringState);
@@ -985,7 +1127,7 @@ function ChatRoomContent() {
     } finally {
       setIsJoining(false);
     }
-  }, [callType, id, initiateSignaling, enterReconnecting, setCallStateSafe]);
+  }, [callType, id, initiateSignaling, enterReconnecting, setCallStateSafe, resetCandidateState]);
 
   const cleanupChannels = useCallback(() => {
     const supabase = getSupabase();
@@ -1055,6 +1197,7 @@ function ChatRoomContent() {
   }, [id]);
 
   const endChat = useCallback(async (goTo: string = "/dashboard") => {
+    console.log("[PeerTalks][SESSION] cleanup reason: user ended chat", { sessionId: id });
     sessionEndedRef.current = true;
     setCallStateSafe("ended");
     if (signalingChannelRef.current) {
@@ -1077,7 +1220,7 @@ function ChatRoomContent() {
     });
     purgeQueueRows();
     router.push(goTo);
-  }, [router, cleanupChannels, purgeQueueRows, endSessionOnServer, setCallStateSafe]);
+  }, [router, cleanupChannels, purgeQueueRows, endSessionOnServer, setCallStateSafe, id]);
 
   // Leaving the page without pressing "End chat" (back button, tab close)
   // must still end the session and purge matching rows — otherwise a stale
@@ -1167,10 +1310,7 @@ function ChatRoomContent() {
 
   const handleReaction = (type: string) => {
     addReaction(type);
-    setOverlayReactions([...reactionsRef.current]);
-    setTimeout(() => {
-      setOverlayReactions([...reactionsRef.current]);
-    }, 100);
+    triggerOverlay();
     if (signalingChannelRef.current) {
       signalingChannelRef.current.send({
         type: "broadcast",
@@ -1180,11 +1320,11 @@ function ChatRoomContent() {
     }
   };
 
-  const toggleMessageReaction = async (messageId: number, emoji: string) => {
+  const toggleMessageReaction = useCallback(async (messageId: number, emoji: string) => {
     const supabase = getSupabase();
     if (!supabase) return;
 
-    const current = reactions[messageId]?.[emoji];
+    const current = messageReactionsRef.current[messageId]?.[emoji];
     const mine = current?.mine ?? false;
 
     // Optimistic update
@@ -1210,7 +1350,7 @@ function ChatRoomContent() {
     if (!res.ok) {
       toast.error("Failed to update reaction");
     }
-  };
+  }, [toast]);
 
   const submitReport = async () => {
     if (!reportReason.trim()) return;
@@ -1304,7 +1444,7 @@ function ChatRoomContent() {
               msg={msg}
               mine={msg.sender_id === myUserId}
               reactions={reactions[msg.id]}
-              onReact={(emoji) => toggleMessageReaction(msg.id, emoji)}
+              onReact={toggleMessageReaction}
             />
           ))}
           {peerTyping && (
@@ -1482,22 +1622,22 @@ function ChatRoomContent() {
                   key={msg.id}
                   msg={msg}
                   mine={msg.sender_id === myUserId}
-                  reactions={reactions[msg.id]}
-                  onReact={(emoji) => toggleMessageReaction(msg.id, emoji)}
-                />
-              ))}
-              {peerTyping && (
-                <div className="flex items-center gap-1.5 px-1 py-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-white/30 animate-bounce" style={{ animationDelay: "0ms" }} />
-                  <span className="w-1.5 h-1.5 rounded-full bg-white/30 animate-bounce" style={{ animationDelay: "150ms" }} />
-                  <span className="w-1.5 h-1.5 rounded-full bg-white/30 animate-bounce" style={{ animationDelay: "300ms" }} />
-                  <span className="text-[10px] text-white/25 ml-1">typing…</span>
-                </div>
-              )}
-              <div ref={messagesEndRef} />
+reactions={reactions[msg.id]}
+              onReact={toggleMessageReaction}
+            />
+          ))}
+          {peerTyping && (
+            <div className="flex items-center gap-1.5 px-1 py-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-white/30 animate-bounce" style={{ animationDelay: "0ms" }} />
+              <span className="w-1.5 h-1.5 rounded-full bg-white/30 animate-bounce" style={{ animationDelay: "150ms" }} />
+              <span className="w-1.5 h-1.5 rounded-full bg-white/30 animate-bounce" style={{ animationDelay: "300ms" }} />
+              <span className="text-[10px] text-white/25 ml-1">typing…</span>
             </div>
-            <div className="p-3 border-t border-white/[0.04]">
-              {emojiPickerOpen && <EmojiPicker onPick={(e) => setNewMessage((v) => v + e)} />}
+          )}
+          <div ref={messagesEndRef} />
+        </div>
+        <div className="p-3 border-t border-white/[0.04]">
+          {emojiPickerOpen && <EmojiPicker onPick={(e) => setNewMessage((v) => v + e)} />}
               <div className="flex gap-2">
                 <button
                   onClick={() => setEmojiPickerOpen((v) => !v)}
@@ -1599,11 +1739,11 @@ function ChatRoomContent() {
   );
 }
 
-function MessageBubble({ msg, mine, reactions, onReact }: {
+const MessageBubble = memo(function MessageBubble({ msg, mine, reactions, onReact }: {
   msg: Message;
   mine: boolean;
   reactions?: Record<string, { count: number; mine: boolean }>;
-  onReact: (emoji: string) => void;
+  onReact: (messageId: number, emoji: string) => void;
 }) {
   return (
     <div className={`flex flex-col ${mine ? "items-end" : "items-start"}`}>
@@ -1622,7 +1762,7 @@ function MessageBubble({ msg, mine, reactions, onReact }: {
             Object.entries(reactions).map(([emoji, data]) => (
               <button
                 key={emoji}
-                onClick={() => onReact(emoji)}
+                onClick={() => onReact(msg.id, emoji)}
                 className={`px-1.5 py-0.5 rounded-full text-[11px] leading-none border ${
                   data.mine
                     ? "bg-white/20 border-white/30"
@@ -1637,7 +1777,7 @@ function MessageBubble({ msg, mine, reactions, onReact }: {
       </div>
     </div>
   );
-}
+});
 
 function EmojiPicker({ onPick }: { onPick: (emoji: string) => void }) {
   return (

@@ -80,6 +80,16 @@ async function init() {
 
   try {
     const { createBrowserClient } = await import("@supabase/ssr");
-    _client = createBrowserClient(supabaseUrl, supabaseKey) as unknown as SupabaseClient;
+    _client = createBrowserClient(supabaseUrl, supabaseKey, {
+      auth: {
+        // The authorization code is exchanged EXACTLY ONCE by
+        // /api/auth/callback. If the browser client also detects the code in
+        // the URL (default) it races the callback and consumes the single-use
+        // code first, leaving the callback with "invalid flow state" — the
+        // user ends up on /login?error despite a valid session. OAuthCodeCapture
+        // funnels every code landing to the callback route.
+        detectSessionInUrl: false,
+      },
+    }) as unknown as SupabaseClient;
   } catch {}
 }

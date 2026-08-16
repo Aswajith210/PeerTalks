@@ -14,10 +14,10 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
   }
   const {
-    data: { session },
-  } = await supabase.auth.getSession();
+    data: { user },
+  } = await supabase.auth.getUser();
 
-  if (!session) {
+  if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -39,7 +39,7 @@ export async function POST(request: Request) {
   }
 
   const deduction = await deductTokens(
-    session.user.id,
+    user.id,
     5,
     "Private room",
     undefined,
@@ -47,7 +47,7 @@ export async function POST(request: Request) {
   );
   if (!deduction.success) {
     console.error("[tokens] room create blocked", {
-      userId: session.user.id, cost: 5, balance: deduction.balance, reason: deduction.reason,
+      userId: user.id, cost: 5, balance: deduction.balance, reason: deduction.reason,
     });
     return NextResponse.json(
       { error: "Insufficient tokens", balance: deduction.balance, reason: deduction.reason },
@@ -55,7 +55,7 @@ export async function POST(request: Request) {
     );
   }
   console.log("[PeerTalks][TOKENS] room create deducted", {
-    userId: session.user.id, idempotent: deduction.idempotent, balance: deduction.balance,
+    userId: user.id, idempotent: deduction.idempotent, balance: deduction.balance,
   });
 
   const passwordHash = await bcrypt.hash(password, 10);
@@ -65,7 +65,7 @@ export async function POST(request: Request) {
     .insert({
       name,
       password_hash: passwordHash,
-      host_id: session.user.id,
+      host_id: user.id,
     })
     .select("id, name, host_id, guest_id, is_active, created_at, ended_at")
     .single();
@@ -75,7 +75,7 @@ export async function POST(request: Request) {
     // (network retry of a committed create) must not be refunded again or
     // the user would mint tokens.
     if (!deduction.idempotent) {
-      await refundOnError(session.user.id, requestKey);
+      await refundOnError(user.id, requestKey);
     }
     if (roomError?.code === "23505") {
       return NextResponse.json(
@@ -92,7 +92,7 @@ export async function POST(request: Request) {
       mode: "private_room",
       status: "waiting",
       call_type: callType,
-      user1_id: session.user.id,
+      user1_id: user.id,
       room_id: room.id.toString(),
     })
     .select()
@@ -102,7 +102,7 @@ export async function POST(request: Request) {
     // Room created but session failed — clean up
     await supabase.from("private_rooms").delete().eq("id", room.id);
     if (!deduction.idempotent) {
-      await refundOnError(session.user.id, requestKey);
+      await refundOnError(user.id, requestKey);
     }
     return NextResponse.json({ error: "Failed to create chat session" }, { status: 500 });
   }

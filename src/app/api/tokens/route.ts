@@ -7,24 +7,24 @@ export async function GET() {
     return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
   }
   const {
-    data: { session },
-  } = await supabase.auth.getSession();
+    data: { user },
+  } = await supabase.auth.getUser();
 
-  if (!session) {
+  if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   const { data: balance, error: balanceError } = await supabase
     .from("token_balances")
     .select("balance, last_daily_at")
-    .eq("user_id", session.user.id)
+    .eq("user_id", user.id)
     .maybeSingle();
 
   // A failed read must NOT be reported as balance 0 — the UI would clobber a
   // known-good balance with it. Report the failure instead.
   if (balanceError) {
     console.error("[tokens] api/tokens select blocked", {
-      userId: session.user.id,
+      userId: user.id,
       message: balanceError.message,
       code: balanceError.code,
     });
@@ -37,7 +37,7 @@ export async function GET() {
   const { data: transactions } = await supabase
     .from("token_transactions")
     .select("*")
-    .eq("user_id", session.user.id)
+    .eq("user_id", user.id)
     .order("created_at", { ascending: false })
     .limit(20);
 

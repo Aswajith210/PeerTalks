@@ -4,8 +4,8 @@ import { NextResponse } from "next/server";
 export async function POST(request: Request) {
   const supabase = await createServerSupabaseClient();
   if (!supabase) return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
-  const { data: { session } } = await supabase.auth.getSession();
-  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const body = await request.json();
   const messageId = Number(body.messageId);
@@ -27,7 +27,7 @@ export async function POST(request: Request) {
     .from("chat_sessions")
     .select("id")
     .eq("id", message.session_id)
-    .or(`user1_id.eq.${session.user.id},user2_id.eq.${session.user.id}`)
+    .or(`user1_id.eq.${user.id},user2_id.eq.${user.id}`)
     .maybeSingle();
 
   if (!chatSession) return NextResponse.json({ error: "Unauthorized" }, { status: 403 });
@@ -35,7 +35,7 @@ export async function POST(request: Request) {
   const { error } = await supabase
     .from("message_reactions")
     .upsert(
-      { message_id: messageId, user_id: session.user.id, reaction },
+      { message_id: messageId, user_id: user.id, reaction },
       { onConflict: "message_id, user_id" }
     );
 
@@ -46,8 +46,8 @@ export async function POST(request: Request) {
 export async function DELETE(request: Request) {
   const supabase = await createServerSupabaseClient();
   if (!supabase) return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
-  const { data: { session } } = await supabase.auth.getSession();
-  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const body = await request.json();
   const messageId = Number(body.messageId);
@@ -58,7 +58,7 @@ export async function DELETE(request: Request) {
     .from("message_reactions")
     .delete()
     .eq("message_id", messageId)
-    .eq("user_id", session.user.id);
+    .eq("user_id", user.id);
 
   if (error) return NextResponse.json({ error: "Failed to remove reaction" }, { status: 500 });
   return NextResponse.json({ success: true });

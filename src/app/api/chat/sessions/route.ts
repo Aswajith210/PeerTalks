@@ -11,10 +11,10 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
   }
   const {
-    data: { session },
-  } = await supabase.auth.getSession();
+    data: { user },
+  } = await supabase.auth.getUser();
 
-  if (!session) {
+  if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -31,7 +31,7 @@ export async function GET(request: Request) {
   const { data: sessions } = await supabase
     .from("chat_sessions")
     .select("*")
-    .or(`user1_id.eq.${session.user.id},user2_id.eq.${session.user.id}`)
+    .or(`user1_id.eq.${user.id},user2_id.eq.${user.id}`)
     .order("created_at", { ascending: false })
     .limit(20);
 
@@ -44,10 +44,10 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
   }
   const {
-    data: { session },
-  } = await supabase.auth.getSession();
+    data: { user },
+  } = await supabase.auth.getUser();
 
-  if (!session) {
+  if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -78,9 +78,9 @@ export async function POST(request: Request) {
       .from("private_rooms")
       .update({ is_active: false, ended_at: new Date().toISOString() })
       .eq("id", chatSession.room_id)
-      .eq("host_id", session.user.id);
+      .eq("host_id", user.id);
     console.log("[PeerTalks][ROOM] private room closed", {
-      roomId: chatSession.room_id, userId: session.user.id,
+      roomId: chatSession.room_id, userId: user.id,
     });
   }
 

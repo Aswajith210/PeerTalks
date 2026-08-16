@@ -28,6 +28,7 @@ export function VideoCard({
   useEffect(() => {
     const el = videoRef.current;
     if (!el) return;
+    let retry: (() => void) | null = null;
     if (stream) {
       el.srcObject = stream;
       console.log("[PeerTalks][WEBRTC] video srcObject set", {
@@ -39,16 +40,32 @@ export function VideoCard({
       if (!muted) {
         // Autoplay policy (esp. mobile Safari) blocks unmuted playback —
         // without an explicit play() the element keeps srcObject but stays
-        // black. The call start is user-gesture driven, so play() resolves.
-        el.play().catch((e: unknown) => {
-          console.warn("[PeerTalks][WEBRTC] remote play() blocked", {
-            name: e instanceof Error ? e.name : String(e),
+        // black. The call start is user-gesture driven, so play() resolves;
+        // when it does not (backgrounded tab, late track), retry on the next
+        // user interaction instead of leaving the peer's video frozen.
+        el.play().catch(() => {
+          console.warn("[PeerTalks][WEBRTC] remote play() blocked, retrying on user gesture", {
+            label,
           });
+          retry = () => {
+            el.play().catch(() => {});
+            window.removeEventListener("pointerdown", retry!);
+            window.removeEventListener("keydown", retry!);
+            retry = null;
+          };
+          window.addEventListener("pointerdown", retry);
+          window.addEventListener("keydown", retry);
         });
       }
     } else {
       el.srcObject = null;
     }
+    return () => {
+      if (retry) {
+        window.removeEventListener("pointerdown", retry);
+        window.removeEventListener("keydown", retry);
+      }
+    };
   }, [stream, muted, label]);
 
   return (

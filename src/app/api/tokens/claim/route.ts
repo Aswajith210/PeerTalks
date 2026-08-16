@@ -10,10 +10,10 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
   }
   const {
-    data: { session },
-  } = await supabase.auth.getSession();
+    data: { user },
+  } = await supabase.auth.getUser();
 
-  if (!session) {
+  if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -26,7 +26,7 @@ export async function POST(request: Request) {
     // EVERY case — claimed or already claimed today. Never re-read the row
     // with a direct select here: a blocked read would mask the real balance
     // as 0 and the dashboard would clobber its display with it.
-    const result = await ensureDailyTokens(session.user.id, tz);
+    const result = await ensureDailyTokens(user.id, tz);
     return NextResponse.json({
       claimed: result.claimed,
       balance: typeof result.balance === "number" ? result.balance : null,
