@@ -23,10 +23,15 @@ export function checkRateLimit(
   const limit = LIMITS[category] || LIMITS.default;
   const now = Date.now();
 
-  const record = requestCounts.get(identifier);
+  // Bucket per category, not per IP alone: with a shared bucket the first
+  // category's limit silently caps ALL API traffic (e.g. "rooms" 20/min
+  // would 429 every request once 20 mixed calls happened in a minute —
+  // two testers on one household IP broke room creation this way).
+  const key = `${category}:${identifier}`;
+  const record = requestCounts.get(key);
 
   if (!record || now >= record.resetAt) {
-    requestCounts.set(identifier, { count: 1, resetAt: now + limit.window });
+    requestCounts.set(key, { count: 1, resetAt: now + limit.window });
     return { allowed: true, remaining: limit.max - 1, resetAt: now + limit.window };
   }
 
