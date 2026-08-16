@@ -693,7 +693,7 @@ function ChatRoomContent() {
           protocol: event.candidate.protocol,
         });
       }
-      if (event.candidate && channel.state === "subscribed" as string) {
+      if (event.candidate && channel.state === "joined") {
         channel.send({
           type: "broadcast",
           event: "signal",
