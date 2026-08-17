@@ -66,6 +66,11 @@ function ChatRoomContent() {
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const supabaseRef = useRef<SupabaseClient | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
+  // The in-flight camera/mic acquisition: "Join call" is clickable before
+  // getUserMedia resolves, so handleJoin must WAIT for this promise instead
+  // of silently returning (which stranded the peer on "Connecting...").
+  const mediaPromiseRef = useRef<Promise<MediaStream | null> | null>(null);
+  const joiningRef = useRef(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const msgChannelRef = useRef<RealtimeChannel | null>(null);
   const signalingChannelRef = useRef<RealtimeChannel | null>(null);
@@ -512,7 +517,7 @@ function ChatRoomContent() {
   useEffect(() => {
     let cancelled = false;
 
-    const startMedia = async () => {
+    const startMedia = async (): Promise<MediaStream | null> => {
       try {
         // startLocalStream() defaults carry the 720p caps — unconstrained
         // getUserMedia would pick the camera's maximum (4K on phones).
@@ -524,11 +529,12 @@ function ChatRoomContent() {
           setLocalStream(stream);
           localStreamRef.current = stream;
           setMediaError(null);
-        } else {
-          // Unmounted while the camera/mic permission was pending — stop
-          // the acquired stream immediately so tracks are not left on.
-          stopLocalStream(stream);
+          return stream;
         }
+        // Unmounted while the camera/mic permission was pending — stop
+        // the acquired stream immediately so tracks are not left on.
+        stopLocalStream(stream);
+        return null;
       } catch {
         // Camera denied — try audio only
         try {
@@ -541,20 +547,25 @@ function ChatRoomContent() {
             localStreamRef.current = stream;
             setVideoEnabled(false);
             setMediaError(null);
-          } else {
-            stopLocalStream(stream);
+            return stream;
           }
+          stopLocalStream(stream);
+          return null;
         } catch {
           if (!cancelled) {
             setMediaError("Camera and microphone access denied. Please allow permissions in your browser and try again.");
           }
+          return null;
         }
       }
     };
 
     // Gate on callLoaded: callType defaults to "video", so without this the
     // camera briefly powers on even for text chats while the session loads.
-    if (callLoaded && callType === "video") startMedia();
+    // The promise is kept so a premature "Join call" click can wait for it.
+    if (callLoaded && callType === "video") {
+      mediaPromiseRef.current = startMedia();
+    }
 
     return () => {
       cancelled = true;
@@ -898,8 +909,10 @@ function ChatRoomContent() {
   const handleJoin = useCallback(async () => {
     // Guard against a double-click / double-invocation: a second
     // RTCPeerConnection would orphan the first (never closed, both send
-    // media) and leak its signaling channel.
-    if (pcRef.current) return;
+    // media) and leak its signaling channel. joiningRef closes the tiny
+    // window before pcRef is assigned (media still pending).
+    if (pcRef.current || joiningRef.current) return;
+    joiningRef.current = true;
     setIsJoining(true);
     try {
       if (callType === "text") {
@@ -907,7 +920,28 @@ function ChatRoomContent() {
         return;
       }
 
-      const stream = localStreamRef.current;
+      let stream = localStreamRef.current;
+      if (!stream) {
+        // "Join call" is clickable before the camera preview exists
+        // (getUserMedia in flight — or still starting while the session
+        // loads). WAIT for the acquisition instead of returning silently: a
+        // silent return strands the peer on "Connecting..." with no offer
+        // ever sent. Bound the wait: if the permission prompt stays
+        // unanswered, surface the error and let the user retry once the
+        // stream (if any) is ready.
+        const deadline = Date.now() + 20000;
+        while (!mediaPromiseRef.current && Date.now() < deadline) {
+          await new Promise<void>((r) => setTimeout(r, 100));
+        }
+        if (mediaPromiseRef.current) {
+          stream = await Promise.race([
+            mediaPromiseRef.current,
+            new Promise<MediaStream | null>((resolve) =>
+              setTimeout(() => resolve(null), Math.max(1, deadline - Date.now()))
+            ),
+          ]);
+        }
+      }
       if (!stream) {
         setMediaError(
           "Camera or microphone is unavailable. Allow permissions in your browser and try again."
@@ -1126,6 +1160,7 @@ function ChatRoomContent() {
       }
     } finally {
       setIsJoining(false);
+      joiningRef.current = false;
     }
   }, [callType, id, initiateSignaling, enterReconnecting, setCallStateSafe, resetCandidateState]);
 
