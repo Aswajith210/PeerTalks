@@ -21,6 +21,23 @@ export async function POST(request: Request) {
   if (!UUID_RE.test(reportedUserId)) return NextResponse.json({ error: "Invalid user id" }, { status: 400 });
   if (sessionId && !UUID_RE.test(sessionId)) return NextResponse.json({ error: "Invalid session id" }, { status: 400 });
 
+  // Dedup: one active report per reporter -> user. Repeated submissions
+  // would otherwise spam the moderation queue with the same accusation.
+  const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const { data: existing } = await supabase
+    .from("reports")
+    .select("id")
+    .eq("reporter_id", user.id)
+    .eq("reported_user_id", reportedUserId)
+    .gte("created_at", dayAgo)
+    .maybeSingle();
+  if (existing) {
+    return NextResponse.json(
+      { error: "You already reported this user recently" },
+      { status: 409 }
+    );
+  }
+
   const { data, error } = await supabase
     .from("reports")
     .insert({ reporter_id: user.id, reported_user_id: reportedUserId, session_id: sessionId, reason })

@@ -1553,6 +1553,7 @@ function ChatRoomContent() {
 
   return (
     <div ref={containerRef} className="flex flex-col h-screen bg-background">
+      <h1 className="sr-only">Video chat</h1>
       <div className="flex-1 flex min-h-0">
         <div className="flex-1 relative">
           <VideoCard
@@ -1569,7 +1570,7 @@ function ChatRoomContent() {
           />
           <ReactionOverlay reactions={overlayReactions} />
           {callState === "reconnecting" && (
-            <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 pointer-events-none">
+            <div role="status" aria-live="polite" className="absolute top-4 left-1/2 -translate-x-1/2 z-30 pointer-events-none">
               <span className="text-[11px] uppercase tracking-wider font-medium px-3 py-1.5 rounded-full bg-warning-soft text-warning border border-warning/20">
                 Reconnecting…
               </span>
