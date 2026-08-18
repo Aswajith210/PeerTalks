@@ -415,6 +415,27 @@ function ChatRoomContent() {
       const supabase = getSupabase();
       if (!supabase || cancelled) return;
 
+      // Merge the newest rows from the DB into the live state, deduped by
+      // id. Used on channel SUBSCRIBED (close the join loss window) and as a
+      // fail-safe re-sync when the tab becomes visible/focused again.
+      const syncMessages = async () => {
+        if (cancelled) return;
+        const { data: msgs } = await supabase
+          .from("messages")
+          .select("*")
+          .eq("session_id", id)
+          .order("created_at", { ascending: false })
+          .limit(200);
+        if (cancelled || !msgs) return;
+        setMessages((prev) => {
+          const merged = new Map(prev.map((m) => [m.id, m]));
+          for (const m of msgs) if (!merged.has(m.id)) merged.set(m.id, m);
+          return [...merged.values()].sort((a, b) =>
+            String(a.created_at).localeCompare(String(b.created_at))
+          );
+        });
+      };
+
       const channel = supabase
         .channel(`messages:${id}`)
         .on(
@@ -444,24 +465,7 @@ function ChatRoomContent() {
           // fetch completing and this channel becoming live are never
           // delivered. Re-fetch on SUBSCRIBED and merge by id (deduped).
           if (status === "SUBSCRIBED" && !cancelled) {
-            void (async () => {
-              const supabase = getSupabase();
-              if (!supabase) return;
-              const { data: msgs } = await supabase
-                .from("messages")
-                .select("*")
-                .eq("session_id", id)
-                .order("created_at", { ascending: false })
-                .limit(200);
-              if (cancelled || !msgs) return;
-              setMessages((prev) => {
-                const merged = new Map(prev.map((m) => [m.id, m]));
-                for (const m of msgs) if (!merged.has(m.id)) merged.set(m.id, m);
-                return [...merged.values()].sort((a, b) =>
-                  String(a.created_at).localeCompare(String(b.created_at))
-                );
-              });
-            })();
+            void syncMessages();
           }
         });
 
@@ -525,12 +529,28 @@ function ChatRoomContent() {
         supabase.removeChannel(channel);
         supabase.removeChannel(reactionsChannel);
       }
+
+      // Fail-safe re-sync: renders and realtime events can be delayed while
+      // a tab is backgrounded. When the user comes back, merge the newest
+      // rows so the list can never stay stale.
+      const onVisible = () => {
+        if (document.visibilityState === "visible") void syncMessages();
+      };
+      const onFocus = () => void syncMessages();
+      document.addEventListener("visibilitychange", onVisible);
+      window.addEventListener("focus", onFocus);
+      removeSyncListeners = () => {
+        document.removeEventListener("visibilitychange", onVisible);
+        window.removeEventListener("focus", onFocus);
+      };
     };
 
+    let removeSyncListeners: (() => void) | null = null;
     setupRealtime();
 
     return () => {
       cancelled = true;
+      removeSyncListeners?.();
       if (msgChannelRef.current && supabaseRef.current) {
         supabaseRef.current.removeChannel(msgChannelRef.current);
         msgChannelRef.current = null;
@@ -1322,13 +1342,14 @@ function ChatRoomContent() {
     const content = newMessage.trim();
     sendingRef.current = true;
     setNewMessage("");
+    let timer: ReturnType<typeof setTimeout> | null = null;
 
     try {
       const s = getSupabase();
       if (!s) return;
       const { data: { user } } = await s.auth.getUser();
       if (!user) return;
-      const { data: inserted, error } = await s
+      const insertPromise = s
         .from("messages")
         .insert({
           session_id: id,
@@ -1337,6 +1358,16 @@ function ChatRoomContent() {
         })
         .select()
         .single();
+      // A hung insert (network stall) must never swallow the message: race
+      // it against a timeout and fall back to the error path (text restored,
+      // lock released) so nothing is lost silently.
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("insert timed out")), 10000);
+      });
+      const { data: inserted, error } = await Promise.race([
+        insertPromise,
+        timeout,
+      ]);
       if (error) {
         console.error("[PeerTalks][MESSAGES] insert failed", {
           sessionId: id, message: error.message,
@@ -1353,7 +1384,15 @@ function ChatRoomContent() {
           prev.some((m) => m.id === inserted.id) ? prev : [...prev, inserted]
         );
       }
+    } catch (e) {
+      console.error("[PeerTalks][MESSAGES] insert failed", {
+        sessionId: id,
+        message: e instanceof Error ? e.message : String(e),
+      });
+      toast.error("Message didn't send — tap send to retry");
+      setNewMessage(content);
     } finally {
+      if (timer) clearTimeout(timer);
       sendingRef.current = false;
     }
   };
