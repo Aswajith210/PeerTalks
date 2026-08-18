@@ -71,6 +71,7 @@ function ChatRoomContent() {
   // of silently returning (which stranded the peer on "Connecting...").
   const mediaPromiseRef = useRef<Promise<MediaStream | null> | null>(null);
   const joiningRef = useRef(false);
+  const sendingRef = useRef(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const msgChannelRef = useRef<RealtimeChannel | null>(null);
   const signalingChannelRef = useRef<RealtimeChannel | null>(null);
@@ -375,12 +376,17 @@ function ChatRoomContent() {
       const supabase = getSupabase();
       if (!supabase) return;
 
+      // Newest 200 first (matches idx_messages_created desc), then reverse so
+      // the list renders in chronological order. Ascending + limit 200 would
+      // keep the OLDEST messages and never load the latest ones in a session
+      // longer than 200 messages.
       const { data: msgs } = await supabase
         .from("messages")
         .select("*")
         .eq("session_id", id)
-        .order("created_at", { ascending: true })
+        .order("created_at", { ascending: false })
         .limit(200);
+      if (msgs) msgs.reverse();
       if (!cancelled) setMessages(msgs ?? []);
 
       // Load reactions for existing messages
@@ -433,6 +439,29 @@ function ChatRoomContent() {
         .subscribe((status) => {
           if (status === "CHANNEL_ERROR" && !cancelled) {
             toast.error("Live message updates failed", "Refresh the page to see new messages");
+          }
+          // Close the loss window: messages inserted between the history
+          // fetch completing and this channel becoming live are never
+          // delivered. Re-fetch on SUBSCRIBED and merge by id (deduped).
+          if (status === "SUBSCRIBED" && !cancelled) {
+            void (async () => {
+              const supabase = getSupabase();
+              if (!supabase) return;
+              const { data: msgs } = await supabase
+                .from("messages")
+                .select("*")
+                .eq("session_id", id)
+                .order("created_at", { ascending: false })
+                .limit(200);
+              if (cancelled || !msgs) return;
+              setMessages((prev) => {
+                const merged = new Map(prev.map((m) => [m.id, m]));
+                for (const m of msgs) if (!merged.has(m.id)) merged.set(m.id, m);
+                return [...merged.values()].sort((a, b) =>
+                  String(a.created_at).localeCompare(String(b.created_at))
+                );
+              });
+            })();
           }
         });
 
@@ -1285,38 +1314,47 @@ function ChatRoomContent() {
   }, []);
 
   const sendMessage = async () => {
+    // In-flight guard: two clicks/Enter presses in the same frame both read
+    // the pre-clear input value and would insert TWO rows (duplicate bubbles
+    // on both sides). The ref flips synchronously, before the first await.
+    if (sendingRef.current) return;
     if (!newMessage.trim()) return;
     const content = newMessage.trim();
+    sendingRef.current = true;
     setNewMessage("");
 
-    const s = getSupabase();
-    if (!s) return;
-    const { data: { user } } = await s.auth.getUser();
-    if (!user) return;
-    const { data: inserted, error } = await s
-      .from("messages")
-      .insert({
-        session_id: id,
-        sender_id: user.id,
-        content,
-      })
-      .select()
-      .single();
-    if (error) {
-      console.error("[PeerTalks][MESSAGES] insert failed", {
-        sessionId: id, message: error.message,
-      });
-      toast.error("Failed to send message");
-      setNewMessage(content);
-      return;
-    }
-    // Optimistic append: the sender's bubble must not depend on a realtime
-    // event that may be delayed or broken. The realtime INSERT handler
-    // dedupes by id, so this cannot double-render.
-    if (inserted) {
-      setMessages((prev) =>
-        prev.some((m) => m.id === inserted.id) ? prev : [...prev, inserted]
-      );
+    try {
+      const s = getSupabase();
+      if (!s) return;
+      const { data: { user } } = await s.auth.getUser();
+      if (!user) return;
+      const { data: inserted, error } = await s
+        .from("messages")
+        .insert({
+          session_id: id,
+          sender_id: user.id,
+          content,
+        })
+        .select()
+        .single();
+      if (error) {
+        console.error("[PeerTalks][MESSAGES] insert failed", {
+          sessionId: id, message: error.message,
+        });
+        toast.error("Failed to send message");
+        setNewMessage(content);
+        return;
+      }
+      // Optimistic append: the sender's bubble must not depend on a realtime
+      // event that may be delayed or broken. The realtime INSERT handler
+      // dedupes by id, so this cannot double-render.
+      if (inserted) {
+        setMessages((prev) =>
+          prev.some((m) => m.id === inserted.id) ? prev : [...prev, inserted]
+        );
+      }
+    } finally {
+      sendingRef.current = false;
     }
   };
 
