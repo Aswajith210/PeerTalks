@@ -186,6 +186,16 @@ const Close = (props: IconProps) => (
   </GlassIcon>
 );
 
+const Trash = (props: IconProps) => (
+  <GlassIcon {...props}>
+    <path d="M3 6h18" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+    <path d="M8 6V4a1 1 0 011-1h6a1 1 0 011 1v2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" fill="none" />
+    <path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" fill="none" />
+    <path d="M10 11v6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+    <path d="M14 11v6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+  </GlassIcon>
+);
+
 const ArrowLeft = (props: IconProps) => (
   <GlassIcon {...props}>
     <path d="M19 12H5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
@@ -307,6 +317,7 @@ const Icons = {
   Laugh,
   Celebrate,
   Close,
+  Trash,
   ArrowLeft,
   Lock,
   Sparkle,

@@ -24,7 +24,7 @@ export interface Database {
       messages: {
         Row: Message;
         Insert: Omit<Message, "id" | "created_at">;
-        Update: never;
+        Update: Partial<Omit<Message, "id" | "session_id">>;
       };
       private_rooms: {
         Row: PrivateRoom;
@@ -107,6 +107,10 @@ export interface Message {
   sender_id: string | null;
   content: string;
   created_at: string;
+  // Soft-delete tombstone (00013): set by the sender's DELETE action; the
+  // bubble renders "Message deleted" instead of the content.
+  deleted_at?: string | null;
+  deleted_by?: string | null;
 }
 
 export interface PrivateRoom {

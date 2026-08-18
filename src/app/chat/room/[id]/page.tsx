@@ -4,7 +4,7 @@ export const dynamic = "force-dynamic";
 
 import { AuthGuard } from "@/components/auth/AuthGuard";
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState, useRef, useCallback, memo } from "react";
+import { useEffect, useState, useRef, useCallback, useMemo, memo } from "react";
 import { createClient } from "@/lib/supabase/client";
 import type { Message } from "@/types/database";
 import type { SupabaseClient, RealtimeChannel } from "@supabase/supabase-js";
@@ -72,11 +72,28 @@ function ChatRoomContent() {
   const mediaPromiseRef = useRef<Promise<MediaStream | null> | null>(null);
   const joiningRef = useRef(false);
   const sendingRef = useRef(false);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const msgChannelRef = useRef<RealtimeChannel | null>(null);
   const signalingChannelRef = useRef<RealtimeChannel | null>(null);
   const sessionChannelRef = useRef<RealtimeChannel | null>(null);
   const reactionsChannelRef = useRef<RealtimeChannel | null>(null);
+  const msgReadsChannelRef = useRef<RealtimeChannel | null>(null);
+  // Seen system (00013): enabled only when the schema actually has the read
+  // tables — the migrations are committed-only until applied, so everything
+  // must degrade to plain chat without them.
+  const [readsEnabled, setReadsEnabled] = useState(false);
+  const readsEnabledRef = useRef(false);
+  // Message ids the PEER has read (drives "Seen" under my bubbles).
+  const [seenByPeer, setSeenByPeer] = useState<ReadonlySet<number>>(new Set());
+  const seenByPeerRef = useRef<Set<number>>(new Set());
+  // My last-read message id (drives the unread badge).
+  const [lastReadId, setLastReadId] = useState<number | null>(null);
+  const lastReadIdRef = useRef<number | null>(null);
+  const markReadsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Auto-scroll: only follow new messages while the user is near the bottom,
+  // so scrolling up to read history is never interrupted.
+  const lastCountRef = useRef(0);
+  const nearBottomRef = useRef(true);
   const userIdRef = useRef<string | null>(null);
   const peerIdRef = useRef<string | null>(null);
   const sessionEndedRef = useRef(false);
@@ -205,9 +222,28 @@ function ChatRoomContent() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
 
+  // Only follow the conversation while the user is near the bottom. A grow in
+  // message count triggers the scroll; history merges (same ids) never yank
+  // the viewport, and scrolling up to read old messages stays uninterrupted.
   useEffect(() => {
-    scrollToBottom();
+    const count = messages.length;
+    if (count > lastCountRef.current && nearBottomRef.current) {
+      scrollToBottom();
+    }
+    lastCountRef.current = count;
   }, [messages]);
+
+  const handleListScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
+    const el = e.currentTarget;
+    nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+  }, []);
+
+  // Opening the chat panel shows the latest messages, not a stale position.
+  useEffect(() => {
+    if (!showChat) return;
+    const t = setTimeout(scrollToBottom, 60);
+    return () => clearTimeout(t);
+  }, [showChat]);
 
   // Load chat session info (call type, peer id)
   useEffect(() => {
@@ -408,6 +444,43 @@ function ChatRoomContent() {
           setReactions(map);
         }
       }
+
+      // Seen system probe (00013): the read tables are committed-only until
+      // applied, so verify they exist first — if not, the chat works exactly
+      // as before (no seen markers, no badge).
+      const probe = await supabase
+        .from("message_reads")
+        .select("message_id", { head: true })
+        .limit(1);
+      if (!cancelled && !probe.error) {
+        readsEnabledRef.current = true;
+        setReadsEnabled(true);
+        const me = userIdRef.current;
+        if (me) {
+          const { data: myState } = await supabase
+            .from("session_read_state")
+            .select("last_read_message_id")
+            .eq("session_id", id)
+            .eq("user_id", me)
+            .maybeSingle();
+          if (!cancelled && myState?.last_read_message_id != null) {
+            lastReadIdRef.current = myState.last_read_message_id;
+            setLastReadId(myState.last_read_message_id);
+          }
+          if (msgs && msgs.length > 0) {
+            const { data: readRows } = await supabase
+              .from("message_reads")
+              .select("message_id, user_id")
+              .in("message_id", msgs.map((m) => m.id));
+            if (!cancelled && readRows) {
+              const seen = new Set<number>();
+              for (const r of readRows) if (r.user_id !== me) seen.add(r.message_id);
+              seenByPeerRef.current = seen;
+              setSeenByPeer(seen);
+            }
+          }
+        }
+      }
     };
     init();
 
@@ -441,20 +514,36 @@ function ChatRoomContent() {
         .on(
           "postgres_changes",
           {
-            event: "INSERT",
+            event: "*",
             schema: "public",
             table: "messages",
             filter: `session_id=eq.${id}`,
           },
           (payload) => {
-            const incoming = payload.new as Message;
-            // Dedupe by id: an optimistically-appended sent message and the
-            // realtime event for the same row must not appear twice.
-            setMessages((prev) =>
-              prev.some((m) => m.id === incoming.id)
-                ? prev.map((m) => (m.id === incoming.id ? incoming : m))
-                : [...prev, incoming]
-            );
+            if (payload.eventType === "INSERT") {
+              const incoming = payload.new as Message;
+              // Dedupe by id: an optimistically-appended sent message and the
+              // realtime event for the same row must not appear twice.
+              setMessages((prev) =>
+                prev.some((m) => m.id === incoming.id)
+                  ? prev.map((m) => (m.id === incoming.id ? incoming : m))
+                  : [...prev, incoming]
+              );
+            } else if (payload.eventType === "UPDATE") {
+              // Soft-delete tombstones arrive here: replace the row so the
+              // peer's open chat shows "Message deleted" without reloading.
+              const incoming = payload.new as Message;
+              setMessages((prev) =>
+                prev.some((m) => m.id === incoming.id)
+                  ? prev.map((m) => (m.id === incoming.id ? incoming : m))
+                  : prev
+              );
+            } else if (payload.eventType === "DELETE") {
+              const oldRow = payload.old as { id?: number } | null;
+              if (oldRow?.id != null) {
+                setMessages((prev) => prev.filter((m) => m.id !== oldRow.id));
+              }
+            }
           }
         )
         .subscribe((status) => {
@@ -522,12 +611,45 @@ function ChatRoomContent() {
         )
         .subscribe();
 
+      // Seen markers: the peer's reads arrive here (gated on the schema
+      // probe so a pre-migration DB just stays quiet). No table filter is
+      // possible (reads don't carry a session id); RLS scopes the payloads.
+      const readsChannel = supabase
+        .channel(`message_reads:${id}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "message_reads",
+          },
+          (payload) => {
+            if (!readsEnabledRef.current) return;
+            const row = payload.new as { message_id?: number; user_id?: string } | null;
+            const oldRow = payload.old as { message_id?: number; user_id?: string } | null;
+            const messageId = row?.message_id ?? oldRow?.message_id;
+            const reader = row?.user_id ?? oldRow?.user_id;
+            if (messageId == null || !reader) return;
+            // My own reads are already reflected locally — only the peer's
+            // markers drive "Seen".
+            if (reader === userIdRef.current) return;
+            const next = new Set(seenByPeerRef.current);
+            if (payload.eventType === "INSERT") next.add(messageId);
+            else if (payload.eventType === "DELETE") next.delete(messageId);
+            seenByPeerRef.current = next;
+            setSeenByPeer(next);
+          }
+        )
+        .subscribe();
+
       if (!cancelled) {
         msgChannelRef.current = channel;
         reactionsChannelRef.current = reactionsChannel;
+        msgReadsChannelRef.current = readsChannel;
       } else {
         supabase.removeChannel(channel);
         supabase.removeChannel(reactionsChannel);
+        supabase.removeChannel(readsChannel);
       }
 
       // Fail-safe re-sync: renders and realtime events can be delayed while
@@ -559,8 +681,64 @@ function ChatRoomContent() {
         supabaseRef.current.removeChannel(reactionsChannelRef.current);
         reactionsChannelRef.current = null;
       }
+      if (msgReadsChannelRef.current && supabaseRef.current) {
+        supabaseRef.current.removeChannel(msgReadsChannelRef.current);
+        msgReadsChannelRef.current = null;
+      }
+      if (markReadsTimerRef.current) {
+        clearTimeout(markReadsTimerRef.current);
+        markReadsTimerRef.current = null;
+      }
     };
   }, [id, joined, toast]);
+
+  // Mark-read (00013): while the chat is visible, advance my last-read
+  // marker to the newest incoming message and record per-message reads so
+  // the peer's bubbles show "Seen". Debounced so bursts coalesce into one
+  // write; fully skipped when the schema lacks the tables or the chat panel
+  // is closed (video mode) — an unread badge then stays honest.
+  useEffect(() => {
+    if (!joined || !readsEnabled) return;
+    const chatVisible = callType === "text" || showChat;
+    if (!chatVisible) return;
+    const last = messages[messages.length - 1];
+    if (!last || last.sender_id === myUserId) return;
+    if (lastReadIdRef.current != null && last.id <= lastReadIdRef.current) return;
+    const s = supabaseRef.current;
+    if (!s) return;
+    const startId = lastReadIdRef.current ?? 0;
+    const toMark = messages
+      .filter((m) => m.id > startId && m.sender_id !== myUserId && !m.deleted_at)
+      .map((m) => m.id);
+    const targetId = last.id;
+    if (markReadsTimerRef.current) clearTimeout(markReadsTimerRef.current);
+    markReadsTimerRef.current = setTimeout(async () => {
+      const me = userIdRef.current;
+      if (!me) return;
+      const { error } = await s
+        .from("session_read_state")
+        .upsert(
+          {
+            session_id: id,
+            user_id: me,
+            last_read_message_id: targetId,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "session_id,user_id" }
+        );
+      if (!error && toMark.length > 0) {
+        await s
+          .from("message_reads")
+          .upsert(toMark.map((mid) => ({ message_id: mid, user_id: me })), {
+            onConflict: "message_id,user_id",
+          });
+      }
+      // Advance the marker regardless: the badge is best-effort and a stale
+      // marker would just re-write the same reads on the next message.
+      lastReadIdRef.current = targetId;
+      setLastReadId(targetId);
+    }, 400);
+  }, [messages, joined, callType, showChat, readsEnabled, myUserId, id]);
 
   // Local media
   useEffect(() => {
@@ -1393,9 +1571,46 @@ function ChatRoomContent() {
       setNewMessage(content);
     } finally {
       if (timer) clearTimeout(timer);
-      sendingRef.current = false;
+sendingRef.current = false;
     }
   };
+
+  // Soft-delete (00013): tombstones the sender's own message; the UPDATE
+  // propagates to the peer's open chat via the realtime channel, and the
+  // bubble renders "Message deleted". If the schema lacks deleted_at the
+  // write fails and the toast explains — the chat itself never breaks.
+  const deleteMessage = useCallback(async (messageId: number) => {
+    const s = getSupabase();
+    if (!s) return;
+    const nowIso = new Date().toISOString();
+    const { error } = await s
+      .from("messages")
+      .update({ deleted_at: nowIso, deleted_by: userIdRef.current })
+      .eq("id", messageId);
+    if (error) {
+      console.error("[PeerTalks][MESSAGES] soft-delete failed", {
+        sessionId: id, messageId, message: error.message,
+      });
+      toast.error("Couldn't delete message");
+      return;
+    }
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === messageId
+          ? { ...m, deleted_at: nowIso, deleted_by: userIdRef.current }
+          : m
+      )
+    );
+  }, [toast, id]);
+
+  // Unread badge (00013): incoming messages newer than my last-read marker.
+  const unreadCount = useMemo(() => {
+    if (!readsEnabled || !myUserId) return 0;
+    const threshold = lastReadId ?? 0;
+    return messages.filter(
+      (m) => m.sender_id !== myUserId && m.id > threshold && !m.deleted_at
+    ).length;
+  }, [messages, readsEnabled, myUserId, lastReadId]);
 
   const notifyTyping = () => {
     const now = Date.now();
@@ -1544,7 +1759,7 @@ function ChatRoomContent() {
             </button>
           </div>
         </div>
-        <div className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-hide overscroll-contain">
+        <div className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-hide overscroll-contain" onScroll={handleListScroll}>
           {messages.length === 0 && (
             <p className="text-sm text-white/20 text-center py-8 font-light">
               No messages yet. Say hello!
@@ -1557,6 +1772,8 @@ function ChatRoomContent() {
               mine={msg.sender_id === myUserId}
               reactions={reactions[msg.id]}
               onReact={toggleMessageReaction}
+              seen={msg.sender_id === myUserId && seenByPeer.has(msg.id)}
+              onDelete={msg.sender_id === myUserId ? deleteMessage : undefined}
             />
           ))}
           {peerTyping && (
@@ -1579,18 +1796,23 @@ function ChatRoomContent() {
             >
               <span className="text-lg leading-none">😊</span>
             </button>
-            <input
+            <textarea
               ref={inputRef}
               placeholder="Type a message..."
               value={newMessage}
+              rows={Math.min(4, Math.max(1, newMessage.split("\n").length))}
               onChange={(e) => {
                 setNewMessage(e.target.value);
                 notifyTyping();
               }}
               onKeyDown={(e) => {
-                if (e.key === "Enter") sendMessage();
+                // Enter sends; Shift+Enter inserts a newline.
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  void sendMessage();
+                }
               }}
-              className="flex-1 h-11 px-4 rounded-xl glass-input text-sm text-white/80 placeholder:text-white/20 transition-all duration-200 focus:outline-none"
+              className="flex-1 min-h-11 max-h-28 py-3 px-4 rounded-xl glass-input text-sm text-white/80 placeholder:text-white/20 transition-all duration-200 focus:outline-none resize-none"
             />
             <button
               onClick={sendMessage}
@@ -1700,6 +1922,11 @@ function ChatRoomContent() {
               aria-label="Open chat"
             >
               <Icons.Chat size={18} />
+              {unreadCount > 0 && (
+                <span className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 rounded-full bg-error text-[10px] font-semibold text-white flex items-center justify-center">
+                  {unreadCount > 99 ? "99+" : unreadCount}
+                </span>
+              )}
             </button>
           )}
         </div>
@@ -1724,7 +1951,7 @@ function ChatRoomContent() {
                 <Icons.Close size={14} />
               </button>
             </div>
-            <div className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-hide overscroll-contain">
+            <div className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-hide overscroll-contain" onScroll={handleListScroll}>
               {messages.length === 0 && (
                 <p className="text-sm text-white/20 text-center py-8 font-light">
                   No messages yet. Say hello!
@@ -1735,22 +1962,24 @@ function ChatRoomContent() {
                   key={msg.id}
                   msg={msg}
                   mine={msg.sender_id === myUserId}
-reactions={reactions[msg.id]}
-              onReact={toggleMessageReaction}
-            />
-          ))}
-          {peerTyping && (
-            <div className="flex items-center gap-1.5 px-1 py-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-white/30 animate-bounce" style={{ animationDelay: "0ms" }} />
-              <span className="w-1.5 h-1.5 rounded-full bg-white/30 animate-bounce" style={{ animationDelay: "150ms" }} />
-              <span className="w-1.5 h-1.5 rounded-full bg-white/30 animate-bounce" style={{ animationDelay: "300ms" }} />
-              <span className="text-[10px] text-white/25 ml-1">typing…</span>
+                  reactions={reactions[msg.id]}
+                  onReact={toggleMessageReaction}
+                  seen={msg.sender_id === myUserId && seenByPeer.has(msg.id)}
+                  onDelete={msg.sender_id === myUserId ? deleteMessage : undefined}
+                />
+              ))}
+              {peerTyping && (
+                <div className="flex items-center gap-1.5 px-1 py-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-white/30 animate-bounce" style={{ animationDelay: "0ms" }} />
+                  <span className="w-1.5 h-1.5 rounded-full bg-white/30 animate-bounce" style={{ animationDelay: "150ms" }} />
+                  <span className="w-1.5 h-1.5 rounded-full bg-white/30 animate-bounce" style={{ animationDelay: "300ms" }} />
+                  <span className="text-[10px] text-white/25 ml-1">typing…</span>
+                </div>
+              )}
+              <div ref={messagesEndRef} />
             </div>
-          )}
-          <div ref={messagesEndRef} />
-        </div>
-        <div className="p-3 border-t border-white/[0.04]">
-          {emojiPickerOpen && <EmojiPicker onPick={(e) => setNewMessage((v) => v + e)} />}
+            <div className="p-3 border-t border-white/[0.04]">
+              {emojiPickerOpen && <EmojiPicker onPick={(e) => setNewMessage((v) => v + e)} />}
               <div className="flex gap-2">
                 <button
                   onClick={() => setEmojiPickerOpen((v) => !v)}
@@ -1759,18 +1988,23 @@ reactions={reactions[msg.id]}
                 >
                   <span className="text-lg leading-none">😊</span>
                 </button>
-                <input
+                <textarea
                   ref={inputRef}
                   placeholder="Type a message..."
                   value={newMessage}
+                  rows={Math.min(4, Math.max(1, newMessage.split("\n").length))}
                   onChange={(e) => {
                     setNewMessage(e.target.value);
                     notifyTyping();
                   }}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter") sendMessage();
+                    // Enter sends; Shift+Enter inserts a newline.
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      void sendMessage();
+                    }
                   }}
-                  className="flex-1 h-11 px-4 rounded-xl glass-input text-sm text-white/80 placeholder:text-white/20 transition-all duration-200 focus:outline-none"
+                  className="flex-1 min-h-11 max-h-28 py-3 px-4 rounded-xl glass-input text-sm text-white/80 placeholder:text-white/20 transition-all duration-200 focus:outline-none resize-none"
                 />
                 <button
                   onClick={sendMessage}
@@ -1852,16 +2086,47 @@ reactions={reactions[msg.id]}
   );
 }
 
-const MessageBubble = memo(function MessageBubble({ msg, mine, reactions, onReact }: {
+const MessageBubble = memo(function MessageBubble({ msg, mine, reactions, onReact, seen, onDelete }: {
   msg: Message;
   mine: boolean;
   reactions?: Record<string, { count: number; mine: boolean }>;
   onReact: (messageId: number, emoji: string) => void;
+  seen?: boolean;
+  onDelete?: (messageId: number) => void;
 }) {
+  if (msg.deleted_at) {
+    return (
+      <div className={`flex flex-col ${mine ? "items-end" : "items-start"}`}>
+        <div className={`max-w-[85%] px-4 py-2.5 rounded-2xl text-xs italic text-white/25 ${mine ? "bg-white/[0.08]" : "bg-white/[0.05]"}`}>
+          Message deleted
+        </div>
+        <div className="flex items-center gap-1.5 mt-1">
+          <span className="text-[10px] text-white/20">
+            {new Date(msg.created_at).toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+            })}
+          </span>
+        </div>
+      </div>
+    );
+  }
   return (
-    <div className={`flex flex-col ${mine ? "items-end" : "items-start"}`}>
-      <div className={`max-w-[85%] px-4 py-2.5 rounded-2xl text-sm text-white/80 ${mine ? "bg-white/20" : "bg-white/10"}`}>
-        {msg.content}
+    <div className={`group flex flex-col ${mine ? "items-end" : "items-start"}`}>
+      <div className={`relative max-w-[85%]`}>
+        <div className={`px-4 py-2.5 rounded-2xl text-sm text-white/80 whitespace-pre-wrap break-words ${mine ? "bg-white/20" : "bg-white/10"}`}>
+          {msg.content}
+        </div>
+        {mine && onDelete && (
+          <button
+            onClick={() => onDelete(msg.id)}
+            className="absolute -left-8 top-1/2 -translate-y-1/2 w-7 h-7 rounded-lg text-white/25 hover:text-error hover:bg-error/[0.1] opacity-0 group-hover:opacity-100 focus:opacity-100 flex items-center justify-center transition-all duration-150"
+            aria-label="Delete message"
+            title="Delete message"
+          >
+            <Icons.Trash size={13} />
+          </button>
+        )}
       </div>
       <div className="flex items-center gap-1.5 mt-1">
         <span className="text-[10px] text-white/20">
@@ -1870,6 +2135,7 @@ const MessageBubble = memo(function MessageBubble({ msg, mine, reactions, onReac
             minute: "2-digit",
           })}
         </span>
+        {mine && seen && <span className="text-[10px] text-emerald-400/80 font-medium">Seen</span>}
         <div className="flex items-center gap-0.5">
           {reactions &&
             Object.entries(reactions).map(([emoji, data]) => (
