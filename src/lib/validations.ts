@@ -31,6 +31,7 @@ export const schemas = {
   createRoom: {
     name: { type: "string", required: true, min: 1, max: 100 },
     password: { type: "string", required: true, min: 6, max: 100 },
+    capacity: { type: "number" },
   },
   joinRoom: {
     name: { type: "string", required: true, min: 1, max: 100 },

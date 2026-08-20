@@ -17,6 +17,7 @@ function PrivateRoomContent() {
   const [callType, setCallType] = useState<"video" | "text">("video");
   const [name, setName] = useState("");
   const [password, setPassword] = useState("");
+  const [capacity, setCapacity] = useState(2);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -36,7 +37,7 @@ function PrivateRoomContent() {
           "x-request-id": globalThis.crypto.randomUUID(),
           "x-call-type": callType,
         },
-        body: JSON.stringify({ name, password }),
+        body: JSON.stringify({ name, password, capacity }),
       });
       const data = await res.json();
 
@@ -52,7 +53,11 @@ function PrivateRoomContent() {
       if (typeof data.balance === "number") setBalance(data.balance);
       await refresh();
 
-      router.push(`/chat/room/${data.session?.id || data.room?.id}`);
+      // Capacity lives behind the 00011 migration. When the backend can't
+      // store it (capacity_supported: false) the room silently falls back
+      // to 2 people — tell the room page so it can say so.
+      const degraded = data.capacity_supported === false ? "?cap=degraded" : "";
+      router.push(`/chat/room/${data.session?.id || data.room?.id}${degraded}`);
     } catch {
       setError("Something went wrong");
       setLoading(false);
@@ -172,6 +177,36 @@ function PrivateRoomContent() {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
             />
+
+            {tab === "create" && (
+              <div className="flex items-center justify-between rounded-xl bg-white/5 border border-white/10 px-4 py-3">
+                <div>
+                  <p className="text-xs font-medium text-white/80">Room capacity</p>
+                  <p className="text-[11px] text-muted">1 host + up to {capacity - 1} guests</p>
+                </div>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    aria-label="Decrease capacity"
+                    onClick={() => setCapacity((c) => Math.max(2, c - 1))}
+                    className="w-7 h-7 rounded-lg bg-white/10 border border-white/10 text-white/80 text-sm hover:bg-white/15 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20"
+                  >
+                    −
+                  </button>
+                  <span aria-label="Capacity value" className="w-6 text-center text-sm font-medium text-white/90">
+                    {capacity}
+                  </span>
+                  <button
+                    type="button"
+                    aria-label="Increase capacity"
+                    onClick={() => setCapacity((c) => Math.min(8, c + 1))}
+                    className="w-7 h-7 rounded-lg bg-white/10 border border-white/10 text-white/80 text-sm hover:bg-white/15 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20"
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
+            )}
 
             {error && <p className="text-xs text-red-400/80">{error}</p>}
 

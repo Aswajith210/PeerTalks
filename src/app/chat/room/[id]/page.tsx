@@ -3,7 +3,7 @@
 export const dynamic = "force-dynamic";
 
 import { AuthGuard } from "@/components/auth/AuthGuard";
-import { useParams, useRouter } from "next/navigation";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useState, useRef, useCallback, useMemo, memo } from "react";
 import { createClient } from "@/lib/supabase/client";
 import type { Message, MessageAttachment } from "@/types/database";
@@ -40,10 +40,16 @@ type CallState =
 function ChatRoomContent() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const toast = useToast();
   const [messages, setMessages] = useState<Message[]>([]);
   const [newMessage, setNewMessage] = useState("");
   const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
+  // Set when the create flow learned the backend can't store capacity
+  // (00011 not deployed) — the room silently holds 2 people.
+  const [capacityDegraded, setCapacityDegraded] = useState(
+    () => searchParams.get("cap") === "degraded"
+  );
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [audioEnabled, setAudioEnabled] = useState(true);
@@ -2187,6 +2193,20 @@ sendingRef.current = false;
   return (
     <div ref={containerRef} className="flex flex-col h-screen bg-background">
       <h1 className="sr-only">Video chat</h1>
+      {capacityDegraded && (
+        <div role="status" className="flex items-center justify-between gap-3 px-4 py-2 bg-warning-soft/60 border-b border-warning/20">
+          <p className="text-[11px] text-warning">
+            Group capacity isn&apos;t available on this server yet — this room holds up to 2 people.
+          </p>
+          <button
+            onClick={() => setCapacityDegraded(false)}
+            aria-label="Dismiss capacity notice"
+            className="shrink-0 w-6 h-6 rounded-md flex items-center justify-center text-warning/70 hover:bg-warning/10 hover:text-warning transition-colors"
+          >
+            ✕
+          </button>
+        </div>
+      )}
       <div className="flex-1 flex min-h-0">
         <div className="flex-1 relative">
           <VideoCard

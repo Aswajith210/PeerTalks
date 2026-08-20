@@ -32,7 +32,17 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: validationError }, { status: 400 });
   }
 
-  const { name, password } = body;
+  const { name, password, capacity } = body;
+  if (
+    capacity !== undefined &&
+    (!Number.isInteger(capacity) || capacity < 2 || capacity > 8)
+  ) {
+    return NextResponse.json(
+      { error: "Room capacity must be between 2 and 8" },
+      { status: 400 }
+    );
+  }
+
   const callType = request.headers.get("x-call-type") ?? "video";
   if (callType !== "video" && callType !== "text") {
     return NextResponse.json({ error: "Invalid call type" }, { status: 400 });
@@ -60,15 +70,44 @@ export async function POST(request: Request) {
 
   const passwordHash = await bcrypt.hash(password, 10);
 
-  const { data: room, error: roomError } = await supabase
+  // Capacity is part of the 00011 migration. When the column is not yet
+  // deployed, PostgREST answers 42703 — retry WITHOUT it so the room still
+  // gets created at the default capacity (2). capacity_supported tells the
+  // client which world it is in.
+  let capacityStored = false;
+  let room: { id: string } | null = null;
+  let roomError: { code?: string } | null = null;
+  const attempt: {
+    data: { id: string } | null;
+    error: { code?: string } | null;
+  } = await supabase
     .from("private_rooms")
     .insert({
       name,
       password_hash: passwordHash,
       host_id: user.id,
+      ...(typeof capacity === "number" ? { capacity } : {}),
     })
-    .select("id, name, host_id, guest_id, is_active, created_at, ended_at")
+    .select(
+      "id, name, host_id, guest_id, is_active, created_at, ended_at" +
+        (typeof capacity === "number" ? ", capacity" : "")
+    )
     .single();
+  room = attempt.data;
+  roomError = attempt.error;
+
+  if (!room && (roomError?.code === "42703" || roomError?.code === "PGRST204")) {
+    // capacity column not deployed — degrade to the default of 2.
+    const retry = await supabase
+      .from("private_rooms")
+      .insert({ name, password_hash: passwordHash, host_id: user.id })
+      .select("id, name, host_id, guest_id, is_active, created_at, ended_at")
+      .single();
+    room = retry.data;
+    roomError = retry.error;
+  } else if (room) {
+    capacityStored = true;
+  }
 
   if (!room) {
     // Only refund when THIS request actually charged — an idempotent replay
@@ -107,5 +146,10 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Failed to create chat session" }, { status: 500 });
   }
 
-  return NextResponse.json({ room, session: chatSession, balance: deduction.balance });
+  return NextResponse.json({
+    room,
+    session: chatSession,
+    balance: deduction.balance,
+    capacity_supported: capacityStored,
+  });
 }

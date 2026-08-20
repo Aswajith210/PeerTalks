@@ -99,10 +99,6 @@ export async function POST(request: Request) {
 
   const room = lookup.room;
 
-  if (room.guest_id) {
-    return NextResponse.json({ error: "Room is full" }, { status: 400 });
-  }
-
   const deduction = await deductTokens(
     user.id,
     5,
@@ -122,6 +118,72 @@ export async function POST(request: Request) {
   console.log("[PeerTalks][TOKENS] room join deducted", {
     userId: user.id, idempotent: deduction.idempotent, balance: deduction.balance,
   });
+
+  // Failure after the 5-token charge — refund so the user only pays when
+  // the private session actually starts. Idempotent replays never refund
+  // (a replay of a committed join must not mint tokens).
+  const refundCharge = async () => {
+    if (!deduction.idempotent) {
+      await refundTokens(user.id, 5, undefined, refundKeyFor(requestKey));
+    }
+  };
+
+  // NEW (00011): atomic join under a row lock — capacity check, membership
+  // record and session reuse in one security-definer transaction. Not
+  // deployed on the live DB (PGRST202) — falls through to the legacy 1-1
+  // join below. Runs after the charge like the legacy path; any failure
+  // refunds.
+  const { data: groupJoin, error: groupJoinError } = await supabase.rpc(
+    "join_private_room",
+    { p_room_id: room.id, p_user_id: user.id }
+  );
+
+  if (!groupJoinError && groupJoin?.success) {
+    if (!groupJoin.session_id) {
+      await refundCharge();
+      return NextResponse.json({ error: "Failed to join room" }, { status: 400 });
+    }
+    // The RPC never sets call_type — normalize the reused/created session.
+    await supabase
+      .from("chat_sessions")
+      .update({ call_type: callType })
+      .eq("id", groupJoin.session_id)
+      .neq("call_type", callType);
+    return NextResponse.json({
+      room,
+      session: { id: groupJoin.session_id },
+      balance: deduction.balance,
+      capacity_supported: true,
+    });
+  }
+
+  if (groupJoinError && groupJoinError.code !== "PGRST202") {
+    await refundCharge();
+    return NextResponse.json({ error: "Failed to join room" }, { status: 500 });
+  }
+
+  if (!groupJoinError && !groupJoin?.success) {
+    await refundCharge();
+    const reason = groupJoin?.error ?? "room_not_found";
+    if (reason === "room_full") {
+      return NextResponse.json({ error: "Room is full" }, { status: 400 });
+    }
+    if (reason === "room_ended") {
+      return NextResponse.json({ error: "Room has ended" }, { status: 400 });
+    }
+    if (reason === "room_not_found") {
+      return NextResponse.json({ error: "Room not found" }, { status: 404 });
+    }
+    return NextResponse.json({ error: "Failed to join room" }, { status: 400 });
+  }
+
+  if (room.guest_id) {
+    // Legacy 1-1 capacity gate — only reached when join_private_room is
+    // missing (PGRST202 above). A group room with the new RPC deployed
+    // never trips this: capacity lives in room_participants instead.
+    await refundCharge();
+    return NextResponse.json({ error: "Room is full" }, { status: 400 });
+  }
 
   // Try RPC first (security definer bypasses RLS)
   const { data: joinResult, error: joinError } = await supabase
@@ -144,15 +206,6 @@ export async function POST(request: Request) {
       balance: deduction.balance,
     });
   }
-
-  // Failure after the 5-token charge — refund so the user only pays when
-  // the private session actually starts. Idempotent replays never refund
-  // (a replay of a committed join must not mint tokens).
-  const refundCharge = async () => {
-    if (!deduction.idempotent) {
-      await refundTokens(user.id, 5, undefined, refundKeyFor(requestKey));
-    }
-  };
 
   if (joinError) {
     if (joinError.code === "PGRST202") {
