@@ -21,6 +21,24 @@ export async function POST(request: Request) {
   if (!UUID_RE.test(reportedUserId)) return NextResponse.json({ error: "Invalid user id" }, { status: 400 });
   if (sessionId && !UUID_RE.test(sessionId)) return NextResponse.json({ error: "Invalid session id" }, { status: 400 });
 
+  // A report must reference a session this user actually participated in —
+  // otherwise anyone could file reports (with fabricated session context)
+  // against users they never met.
+  if (sessionId) {
+    const { data: session } = await supabase
+      .from("chat_sessions")
+      .select("id")
+      .eq("id", sessionId)
+      .or(`user1_id.eq.${user.id},user2_id.eq.${user.id}`)
+      .maybeSingle();
+    if (!session) {
+      return NextResponse.json(
+        { error: "You can only report users within a session you joined" },
+        { status: 403 }
+      );
+    }
+  }
+
   // Dedup: one active report per reporter -> user. Repeated submissions
   // would otherwise spam the moderation queue with the same accusation.
   const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();

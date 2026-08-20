@@ -54,6 +54,10 @@ function InterestChatContent() {
   const timeoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const requestKeyRef = useRef<string | null>(null);
+  // Aborts the in-flight poll POST the moment a realtime match lands, so a
+  // stale poll response can never navigate to a DIFFERENT (second) session
+  // than the one the queue row points at.
+  const abortControllerRef = useRef<AbortController | null>(null);
   // Attempt generation: bumped on start/cancel/abort so a stale in-flight
   // poll response (or its pending navigation timer) can never push the user
   // into a room after they cancelled.
@@ -83,6 +87,11 @@ function InterestChatContent() {
     }
   }, []);
 
+  const abortInflightPoll = useCallback(() => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+  }, []);
+
   const releaseLocalMedia = useCallback(() => {
     stopLocalStream(localStreamRef.current);
     localStreamRef.current = null;
@@ -99,7 +108,7 @@ function InterestChatContent() {
         headers: key ? { "x-request-id": key } : {},
       }).catch(() => {});
     };
-  }, [unsubscribeMatching, clearMatchingTimers, releaseLocalMedia]);
+  }, [unsubscribeMatching, clearMatchingTimers, abortInflightPoll, releaseLocalMedia]);
 
   const toggleInterest = (interest: string) => {
     setInterests((prev) =>
@@ -126,6 +135,7 @@ function InterestChatContent() {
     matchingRef.current = true;
     attemptGenRef.current++;
     const gen = attemptGenRef.current;
+    abortControllerRef.current = new AbortController();
 
     setStatus("matching");
     setError(null);
@@ -137,6 +147,7 @@ function InterestChatContent() {
       matchingRef.current = false;
       attemptGenRef.current++;
       clearMatchingTimers();
+      abortInflightPoll();
       unsubscribeMatching();
       releaseLocalMedia();
       // Send the attempt's idempotency key so the server refund is keyed
@@ -224,6 +235,7 @@ function InterestChatContent() {
               matchingRef.current = false;
               setStatus("connected");
               clearMatchingTimers();
+              abortInflightPoll();
               releaseLocalMedia();
               setTimeout(() => {
                 if (attemptGenRef.current === gen) {
@@ -252,6 +264,7 @@ function InterestChatContent() {
             "x-request-id": requestKeyRef.current ?? "",
           },
           body: JSON.stringify({ interests }),
+          signal: abortControllerRef.current?.signal,
         });
         const data = await res.json().catch(() => null);
         if (typeof data?.balance === "number") setBalance(data.balance);
@@ -319,10 +332,14 @@ function InterestChatContent() {
           "Couldn't find a match this time. Please try again — both users need to be waiting at the same time."
         );
       }, MATCHING_TIMEOUT_MS);
-    } catch {
+    } catch (e) {
+      // An aborted poll is the SUCCESS path (a realtime match landed while
+      // the POST was in flight) — never surface it as an error or purge the
+      // queue row here.
+      if (e instanceof DOMException && e.name === "AbortError") return;
       abortWithError("Something went wrong. Please try again.");
     }
-  }, [interests, callType, router, unsubscribeMatching, refresh, setBalance, clearMatchingTimers, releaseLocalMedia]);
+  }, [interests, callType, router, unsubscribeMatching, refresh, setBalance, clearMatchingTimers, abortInflightPoll, releaseLocalMedia]);
 
   const cancelMatching = useCallback(async () => {
     // Bump the attempt generation: an in-flight poll response (or its
@@ -331,6 +348,7 @@ function InterestChatContent() {
     attemptGenRef.current++;
     matchingRef.current = false;
     clearMatchingTimers();
+    abortInflightPoll();
     unsubscribeMatching();
     releaseLocalMedia();
     const key = requestKeyRef.current;
@@ -346,7 +364,7 @@ function InterestChatContent() {
     }
     await refresh();
     setStatus("select");
-  }, [unsubscribeMatching, refresh, setBalance, clearMatchingTimers, releaseLocalMedia]);
+  }, [unsubscribeMatching, refresh, setBalance, clearMatchingTimers, abortInflightPoll, releaseLocalMedia]);
 
   return (
     <div className="min-h-screen flex items-center justify-center px-4 pt-16">

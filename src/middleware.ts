@@ -28,26 +28,6 @@ const SECURITY_HEADERS: Record<string, string> = {
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
-  // Rate limiting for API routes
-  if (pathname.startsWith("/api/")) {
-    const identifier = request.headers.get("x-forwarded-for") || request.headers.get("x-real-ip") || "unknown";
-    const category = getRateLimitCategory(pathname);
-    const result = checkRateLimit(identifier, category);
-
-    if (!result.allowed) {
-      return new NextResponse(
-        JSON.stringify({ error: "Too many requests. Please try again later." }),
-        {
-          status: 429,
-          headers: {
-            "Content-Type": "application/json",
-            "Retry-After": String(Math.ceil((result.resetAt - Date.now()) / 1000)),
-          },
-        }
-      );
-    }
-  }
-
   // Supabase session refresh.
   // NOTE: the OAuth callback path must NOT touch the session here — the fresh
   // authorization code is exchanged exactly once by the route handler, and any
@@ -85,6 +65,34 @@ export async function middleware(request: NextRequest) {
 
     const { data } = await supabase.auth.getUser();
     user = data.user;
+
+    // Rate limiting for API routes — keyed by the authenticated user when
+    // possible (an IP spoofed in x-forwarded-for cannot rotate around it),
+    // falling back to the client IP. x-forwarded-for may be a comma-separated
+    // chain ("client, proxy1"); the FIRST entry is the client.
+    if (pathname.startsWith("/api/")) {
+      const forwarded = request.headers.get("x-forwarded-for") ?? "";
+      const clientIp =
+        request.headers.get("x-real-ip") ||
+        (forwarded.includes(",") ? forwarded.split(",")[0].trim() : forwarded) ||
+        "unknown";
+      const identifier = user?.id ?? clientIp;
+      const category = getRateLimitCategory(pathname);
+      const result = checkRateLimit(identifier, category);
+
+      if (!result.allowed) {
+        return new NextResponse(
+          JSON.stringify({ error: "Too many requests. Please try again later." }),
+          {
+            status: 429,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": String(Math.ceil((result.resetAt - Date.now()) / 1000)),
+            },
+          }
+        );
+      }
+    }
 
     // Route protection: pages that require an authenticated session redirect
     // to /login (validated server-side via the JWT, not the cookie alone).

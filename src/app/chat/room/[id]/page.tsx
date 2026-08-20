@@ -1736,33 +1736,30 @@ function ChatRoomContent() {
       if (!s) return;
       const { data: { user } } = await s.auth.getUser();
       if (!user) return;
-      const insertPromise = s
-        .from("messages")
-        .insert({
-          session_id: id,
-          sender_id: user.id,
-          content,
-        })
-        .select()
-        .single();
+      // Sends go through the server API route: it re-validates the session
+      // membership and content server-side and is covered by the middleware
+      // rate limiter. Direct client inserts would bypass both.
+      const insertPromise = fetch("/api/chat/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: id, content }),
+      }).then(async (res) => {
+        if (!res.ok) {
+          const body = (await res.json().catch(() => null)) as { error?: string } | null;
+          throw new Error(body?.error ?? `send failed (${res.status})`);
+        }
+        return res.json();
+      });
       // A hung insert (network stall) must never swallow the message: race
       // it against a timeout and fall back to the error path (text restored,
       // lock released) so nothing is lost silently.
       const timeout = new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error("insert timed out")), 10000);
       });
-      const { data: inserted, error } = await Promise.race([
+      const inserted = await Promise.race([
         insertPromise,
         timeout,
       ]);
-      if (error) {
-        console.error("[PeerTalks][MESSAGES] insert failed", {
-          sessionId: id, message: error.message,
-        });
-        toast.error("Failed to send message");
-        setNewMessage(content);
-        return;
-      }
       // Optimistic append: the sender's bubble must not depend on a realtime
       // event that may be delayed or broken. The realtime INSERT handler
       // dedupes by id, so this cannot double-render.

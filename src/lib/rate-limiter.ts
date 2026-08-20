@@ -8,9 +8,24 @@ const LIMITS: Record<string, { window: number; max: number }> = {
   // client silently kept "Finding someone" forever. 60/min fits both devices.
   matching: { window: 60_000, max: 60 },
   rooms: { window: 60_000, max: 20 },
-  messages: { window: 60_000, max: 30 },
+  // Keyed per authenticated user when available (see middleware) — a chatty
+  // user sends more than 30/min only in rare bursts; per-user buckets make
+  // that safe without letting a shared IP starve the other household member.
+  messages: { window: 60_000, max: 60 },
   tokens: { window: 10_000, max: 10 },
 };
+
+// Upper bound on tracked buckets: prevents a hostile flood of distinct
+// identifiers (spoofed IPs) from growing memory without limit. Sweeps run
+// lazily on access once the map is full.
+const MAX_BUCKETS = 10_000;
+
+function sweepExpired(now: number): void {
+  if (requestCounts.size < MAX_BUCKETS) return;
+  for (const [key, record] of requestCounts) {
+    if (now >= record.resetAt) requestCounts.delete(key);
+  }
+}
 
 export function getRateLimitKey(key: string): string {
   return key;
@@ -28,6 +43,7 @@ export function checkRateLimit(
   // would 429 every request once 20 mixed calls happened in a minute —
   // two testers on one household IP broke room creation this way).
   const key = `${category}:${identifier}`;
+  sweepExpired(now);
   const record = requestCounts.get(key);
 
   if (!record || now >= record.resetAt) {
