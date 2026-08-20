@@ -46,10 +46,31 @@ function ChatRoomContent() {
   const [newMessage, setNewMessage] = useState("");
   const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
   // Set when the create flow learned the backend can't store capacity
-  // (00011 not deployed) — the room silently holds 2 people.
-  const [capacityDegraded, setCapacityDegraded] = useState(
-    () => searchParams.get("cap") === "degraded"
-  );
+  // (00011 not deployed) — the room silently holds 2 people. Derived from
+  // searchParams (not a useState initializer): useSearchParams is empty on
+  // the SSR/hydration pass, so capturing it into state would freeze the
+  // notice as invisible forever. The dismiss flag is separate so hiding the
+  // notice survives param updates.
+  const capacityDegraded = searchParams.get("cap") === "degraded";
+  const [capNoticeDismissed, setCapNoticeDismissed] = useState(false);
+  // The notice must also be visible on the JOIN screen (the host lands there
+  // right after creating the room with ?cap=degraded), so it renders above the
+  // full-screen JoinScreen (z-50) as a fixed z-[60] overlay until dismissed.
+  const capacityBanner =
+    capacityDegraded && !capNoticeDismissed ? (
+      <div role="status" className="flex items-center justify-between gap-3 px-4 py-2 bg-warning-soft/60 border-b border-warning/20">
+        <p className="text-[11px] text-warning">
+          Group capacity isn&apos;t available on this server yet — this room holds up to 2 people.
+        </p>
+        <button
+          onClick={() => setCapNoticeDismissed(true)}
+          aria-label="Dismiss capacity notice"
+          className="shrink-0 w-6 h-6 rounded-md flex items-center justify-center text-warning/70 hover:bg-warning/10 hover:text-warning transition-colors"
+        >
+          ✕
+        </button>
+      </div>
+    ) : null;
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [audioEnabled, setAudioEnabled] = useState(true);
@@ -2176,37 +2197,27 @@ sendingRef.current = false;
 
   if (!joined) {
     return (
-      <JoinScreen
-        stream={localStream}
-        roomId={id}
-        audioEnabled={audioEnabled}
-        videoEnabled={videoEnabled}
-        onToggleAudio={toggleAudio}
-        onToggleVideo={toggleVideo}
-        onJoin={handleJoin}
-        isJoining={isJoining}
-        mediaError={mediaError}
-      />
+      <>
+        {capacityBanner && <div className="fixed top-0 left-0 right-0 z-[60]">{capacityBanner}</div>}
+        <JoinScreen
+          stream={localStream}
+          roomId={id}
+          audioEnabled={audioEnabled}
+          videoEnabled={videoEnabled}
+          onToggleAudio={toggleAudio}
+          onToggleVideo={toggleVideo}
+          onJoin={handleJoin}
+          isJoining={isJoining}
+          mediaError={mediaError}
+        />
+      </>
     );
   }
 
   return (
     <div ref={containerRef} className="flex flex-col h-screen bg-background">
       <h1 className="sr-only">Video chat</h1>
-      {capacityDegraded && (
-        <div role="status" className="flex items-center justify-between gap-3 px-4 py-2 bg-warning-soft/60 border-b border-warning/20">
-          <p className="text-[11px] text-warning">
-            Group capacity isn&apos;t available on this server yet — this room holds up to 2 people.
-          </p>
-          <button
-            onClick={() => setCapacityDegraded(false)}
-            aria-label="Dismiss capacity notice"
-            className="shrink-0 w-6 h-6 rounded-md flex items-center justify-center text-warning/70 hover:bg-warning/10 hover:text-warning transition-colors"
-          >
-            ✕
-          </button>
-        </div>
-      )}
+      {capacityBanner}
       <div className="flex-1 flex min-h-0">
         <div className="flex-1 relative">
           <VideoCard
