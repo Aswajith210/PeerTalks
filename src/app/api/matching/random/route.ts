@@ -123,6 +123,18 @@ async function tryDirectMatch(
     matched_at: new Date().toISOString(),
   });
 
+  // Consume the caller's own waiting row (if any) so it can never be
+  // re-matched into a second session later.
+  await admin
+    .from("matching_queue")
+    .update({
+      status: "matched", matched_user_id: candidate.user_id,
+      session_id: chat.id, matched_at: new Date().toISOString(),
+    })
+    .eq("user_id", userId)
+    .eq("mode", "random")
+    .eq("status", "waiting");
+
   return { matched: true, session_id: chat.id, peer_id: candidate.user_id };
 }
 
@@ -186,6 +198,52 @@ export async function POST(request: Request) {
     });
   }
 
+  // Insert OUR waiting row BEFORE matching (first POST of the attempt only).
+  // The RPC pairs us with the OLDEST other waiting row, so our own row must
+  // already exist while the RPC runs — otherwise two users who start in the
+  // same poll window can both see an empty queue and neither ever matches.
+  let queueEntry: { id: number } | null = null;
+  if (!deduction.idempotent) {
+    const inserted = await supabase
+      .from("matching_queue")
+      .insert({ user_id: userId, mode: "random", call_type: callType, status: "waiting" })
+      .select().single();
+    queueEntry = (inserted.data as { id: number } | null) ?? null;
+    if (!queueEntry) {
+      console.log("[PeerTalks][QUEUE] waiting row", {
+        userId, queueId: null, insertFailed: true,
+        error: inserted.error ? { code: inserted.error.code, message: inserted.error.message } : null,
+      });
+      await refundTokens(userId, TOKEN_COSTS.VIDEO_CHAT, undefined, refundKeyFor(requestKey));
+      console.log("[PeerTalks][TOKENS] refunded on queue_insert_failed", { userId });
+      return NextResponse.json(
+        {
+          matched: false,
+          error: "Could not join the matching queue. Please try again.",
+          reason: "queue_insert_failed",
+        },
+        { status: 500 }
+      );
+    }
+  }
+
+  // Reap waiting rows from killed browsers / abandoned attempts. The RPC
+  // pairs with the OLDEST waiting row, so a row left behind by a dead page
+  // would otherwise be matched forever after and strand the new peer.
+  if (process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    try {
+      const admin = createAdminClient();
+      await admin
+        .from("matching_queue")
+        .delete()
+        .eq("mode", "random")
+        .eq("status", "waiting")
+        .lt("created_at", new Date(Date.now() - 120_000).toISOString());
+    } catch {
+      // Service-role unavailable — own-row cleanup below still applies.
+    }
+  }
+
   // Try RPC first
   const rpcResult = await supabase.rpc("find_random_match", { p_user_id: userId, p_call_type: callType });
   const rpcData = rpcResult.data as Record<string, unknown> | null;
@@ -246,6 +304,32 @@ export async function POST(request: Request) {
   }
 
   if (matchResult?.matched) {
+    // The deployed find_random_match has no re-match guard, so a peer whose
+    // poll overlaps ours can counter-match us into a NEWER session while our
+    // own RPC is in flight. Wait a beat, then re-check: the newest own match
+    // wins — both users converge on ONE session this way.
+    await new Promise((r) => setTimeout(r, 150));
+    const ownMatch = await findOwnRecentMatch(supabase, userId);
+    if (ownMatch) {
+      console.log("[PeerTalks][SESSION] counter-match picked newer session", {
+        userId, sessionId: ownMatch.session_id, peerId: ownMatch.peer_id,
+      });
+      matchResult = { matched: true, session_id: ownMatch.session_id, peer_id: ownMatch.peer_id };
+    }
+    // Consume our own waiting row so it can never be picked up by a later
+    // peer RPC (which would create a SECOND session for us — the RPC only
+    // flips the PEER's row and inserts a fresh matched row for the caller).
+    await supabase
+      .from("matching_queue")
+      .update({
+        status: "matched",
+        matched_user_id: matchResult.peer_id as string,
+        session_id: matchResult.session_id as string,
+        matched_at: new Date().toISOString(),
+      })
+      .eq("user_id", userId)
+      .eq("mode", "random")
+      .eq("status", "waiting");
     console.log("[PeerTalks][SESSION] matched", {
       userId, sessionId: matchResult.session_id, peerId: matchResult.peer_id,
     });
@@ -257,47 +341,11 @@ export async function POST(request: Request) {
     });
   }
 
-  // Idempotent replay: the FIRST POST of this attempt already inserted the
-  // waiting row, so re-inserting one here would stack a second row AND make
-  // the refund-on-DELETE race refundable twice (POST commit → DELETE refund
-  // → in-flight replay re-inserts → second DELETE refunds again = mint).
-  // Replays just report the still-queued state.
-  if (deduction.idempotent) {
-    return NextResponse.json({
-      matched: false,
-      message: "Waiting for a match...",
-      balance: deduction.balance,
-    });
-  }
-
-  const { data: queueEntry, error: queueError } = await supabase
-    .from("matching_queue")
-    .insert({ user_id: userId, mode: "random", call_type: callType, status: "waiting" })
-    .select().single();
-
-  console.log("[PeerTalks][QUEUE] waiting row", {
-    userId, queueId: queueEntry?.id ?? null, insertFailed: !queueEntry,
-    error: queueError ? { code: queueError.code, message: queueError.message } : null,
-  });
-
-  if (!queueEntry) {
-    // Nothing was charged for a usable queue spot — refund the attempt so
-    // a failed join never costs tokens.
-    await refundTokens(userId, TOKEN_COSTS.VIDEO_CHAT, undefined, refundKeyFor(requestKey));
-    console.log("[PeerTalks][TOKENS] refunded on queue_insert_failed", { userId });
-    return NextResponse.json(
-      {
-        matched: false,
-        error: "Could not join the matching queue. Please try again.",
-        reason: "queue_insert_failed",
-      },
-      { status: 500 }
-    );
-  }
-
+  // No match yet. The waiting row was already inserted above (first POST of
+  // the attempt); replays just report the still-queued state.
   return NextResponse.json({
     matched: false,
-    queueId: queueEntry.id,
+    queueId: queueEntry?.id ?? null,
     message: "Waiting for a match...",
     balance: deduction.balance,
   });

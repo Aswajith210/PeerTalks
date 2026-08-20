@@ -14,6 +14,8 @@ interface CallControlsProps {
   onFullscreen: () => void;
   onReport: () => void;
   onBlock: () => void;
+  onToggleScreenShare: () => void;
+  screenSharing: boolean;
   showChat: boolean;
 }
 
@@ -63,6 +65,8 @@ export function CallControls({
   onFullscreen,
   onReport,
   onBlock,
+  onToggleScreenShare,
+  screenSharing,
   showChat,
 }: CallControlsProps) {
   const [visible, setVisible] = useState(true);
@@ -234,6 +238,20 @@ export function CallControls({
           />
           {showMore && (
             <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-3 glass-strong rounded-2xl px-3 py-2.5 flex flex-col gap-1 shadow-glass-lg border-white/[0.06] whitespace-nowrap">
+              <button
+                onClick={() => { onToggleScreenShare(); setShowMore(false); }}
+                className={`flex items-center gap-2.5 px-3 py-2 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] text-xs transition-all duration-200 btn-premium text-left ${screenSharing ? "text-warning" : "text-white/70"}`}
+                aria-label={screenSharing ? "Stop sharing screen" : "Share screen"}
+              >
+                <svg className="w-4 h-4 text-white/50" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
+                  <rect x="2" y="3" width="20" height="14" rx="2" />
+                  <path d="M8 21h8" />
+                  <path d="M12 17v4" />
+                  <path d="M8 8l3 3-3 3" />
+                  <path d="M13 14h4" />
+                </svg>
+                {screenSharing ? "Stop sharing screen" : "Share screen"}
+              </button>
               <button
                 onClick={() => { onNext(); setShowMore(false); }}
                 className="flex items-center gap-2.5 px-3 py-2 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] text-xs text-white/70 transition-all duration-200 btn-premium text-left"

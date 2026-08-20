@@ -127,6 +127,18 @@ async function tryDirectMatch(
     matched_at: new Date().toISOString(),
   });
 
+  // Consume the caller's own waiting row (if any) so it can never be
+  // re-matched into a second session later.
+  await admin
+    .from("matching_queue")
+    .update({
+      status: "matched", matched_user_id: candidate.user_id,
+      session_id: chat.id, matched_at: new Date().toISOString(),
+    })
+    .eq("user_id", userId)
+    .eq("mode", "interest")
+    .eq("status", "waiting");
+
   const matchedInterest =
     ((candidate.interests as string[] | null) ?? []).find((t) => mine.has(t.toLowerCase().trim())) ?? "";
   return { matched: true, session_id: chat.id, peer_id: candidate.user_id, matched_interest: matchedInterest };
@@ -205,17 +217,6 @@ export async function POST(request: Request) {
     userId, idempotent: deduction.idempotent, balance: deduction.balance,
   });
 
-  // A replayed request must not stack a second waiting row — the original
-  // POST of this attempt already queued one (see random route: replay does
-  // not re-insert, which also closes the double-refund DELETE race).
-  if (deduction.idempotent) {
-    return NextResponse.json({
-      matched: false,
-      message: "Looking for someone who shares your interests...",
-      balance: deduction.balance,
-    });
-  }
-
   // Pre-check: if the PEER's RPC already matched us while our previous
   // poll was in flight, return that exact session instead of letting our
   // own RPC match a THIRD user (the duplicate-session race).
@@ -230,6 +231,48 @@ export async function POST(request: Request) {
       matchedInterest: "",
       balance: deduction.balance,
     });
+  }
+
+  // Insert OUR waiting row BEFORE matching (first POST of the attempt only)
+  // so the RPC — or a peer's RPC — can pair us in the same poll window.
+  let queueEntry: { id: number } | null = null;
+  if (!deduction.idempotent) {
+    const inserted = await supabase
+      .from("matching_queue")
+      .insert({ user_id: userId, mode: "interest", call_type: callType, interests, status: "waiting" })
+      .select().single();
+    queueEntry = (inserted.data as { id: number } | null) ?? null;
+    if (!queueEntry) {
+      console.log("[PeerTalks][Queue] waiting row", {
+        userId, queueId: null, insertFailed: true,
+        error: inserted.error ? { code: inserted.error.code, message: inserted.error.message } : null,
+      });
+      await refundTokens(userId, TOKEN_COSTS.VIDEO_CHAT, undefined, refundKeyFor(requestKey));
+      console.log("[PeerTalks][TOKENS] refunded on queue_insert_failed", { userId });
+      return NextResponse.json(
+        {
+          matched: false,
+          error: "Could not join the matching queue. Please try again.",
+          reason: "queue_insert_failed",
+        },
+        { status: 500 }
+      );
+    }
+  }
+
+  // Reap waiting rows from killed browsers / abandoned attempts.
+  if (process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    try {
+      const admin = createAdminClient();
+      await admin
+        .from("matching_queue")
+        .delete()
+        .eq("mode", "interest")
+        .eq("status", "waiting")
+        .lt("created_at", new Date(Date.now() - 120_000).toISOString());
+    } catch {
+      // Service-role unavailable — own-row cleanup still applies.
+    }
   }
 
   let matchResult: Record<string, unknown> | null = null;
@@ -289,44 +332,47 @@ export async function POST(request: Request) {
   }
 
   if (matchResult?.matched) {
+    // The deployed find_interest_match has no re-match guard, so a peer whose
+    // poll overlaps ours can counter-match us into a NEWER session while our
+    // own RPC is in flight. Wait a beat, then re-check: the newest own match
+    // wins — both users converge on ONE session this way.
+    const matchedInterest = (matchResult.matched_interest as string) ?? "";
+    await new Promise((r) => setTimeout(r, 150));
+    const ownMatch = await findOwnRecentMatch(supabase, userId);
+    if (ownMatch) {
+      console.log("[PeerTalks][SESSION] counter-match picked newer session", {
+        userId, sessionId: ownMatch.session_id, peerId: ownMatch.peer_id,
+      });
+      matchResult = { matched: true, session_id: ownMatch.session_id, peer_id: ownMatch.peer_id };
+    }
+    // Consume our own waiting row so it can never be re-matched into a
+    // second session later.
+    await supabase
+      .from("matching_queue")
+      .update({
+        status: "matched",
+        matched_user_id: matchResult.peer_id as string,
+        session_id: matchResult.session_id as string,
+        matched_at: new Date().toISOString(),
+      })
+      .eq("user_id", userId)
+      .eq("mode", "interest")
+      .eq("status", "waiting");
     console.log("[PeerTalks][Session] matched via RPC", {
       userId, sessionId: matchResult.session_id, peerId: matchResult.peer_id,
     });
     return NextResponse.json({
       matched: true,
       sessionId: matchResult.session_id as string,
-      matchedInterest: (matchResult.matched_interest as string) ?? "",
+      matchedInterest,
       balance: deduction.balance,
     });
   }
 
-  const { data: queueEntry, error: queueError } = await supabase
-    .from("matching_queue")
-    .insert({ user_id: userId, mode: "interest", call_type: callType, interests, status: "waiting" })
-    .select().single();
-
-  console.log("[PeerTalks][Queue] waiting row", {
-    userId, queueId: queueEntry?.id ?? null, insertFailed: !queueEntry,
-    error: queueError ? { code: queueError.code, message: queueError.message } : null,
-  });
-
-  if (!queueEntry) {
-    // Nothing was charged for a usable queue spot — refund the attempt.
-    await refundTokens(userId, TOKEN_COSTS.VIDEO_CHAT, undefined, refundKeyFor(requestKey));
-    console.log("[PeerTalks][TOKENS] refunded on queue_insert_failed", { userId });
-    return NextResponse.json(
-      {
-        matched: false,
-        error: "Could not join the matching queue. Please try again.",
-        reason: "queue_insert_failed",
-      },
-      { status: 500 }
-    );
-  }
-
+  // No match yet — the waiting row was already inserted above.
   return NextResponse.json({
     matched: false,
-    queueId: queueEntry.id,
+    queueId: queueEntry?.id ?? null,
     message: "Looking for someone who shares your interests...",
     balance: deduction.balance,
   });

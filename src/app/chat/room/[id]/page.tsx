@@ -58,6 +58,10 @@ function ChatRoomContent() {
   const [reportReason, setReportReason] = useState("");
   const [reportSubmitting, setReportSubmitting] = useState(false);
   const [showBlockConfirm, setShowBlockConfirm] = useState(false);
+  const [screenSharing, setScreenSharing] = useState(false);
+  const [peerScreenSharing, setPeerScreenSharing] = useState(false);
+  const screenStreamRef = useRef<MediaStream | null>(null);
+  const cameraVideoTrackRef = useRef<MediaStreamTrack | null>(null);
   const [myUserId, setMyUserId] = useState<string | null>(null);
   const [clientReady, setClientReady] = useState(false);
   const [reactions, setReactions] = useState<Record<number, Record<string, { count: number; mine: boolean }>>>({});
@@ -961,6 +965,13 @@ function ChatRoomContent() {
       handlePeerLeft();
     });
 
+    channel.on("broadcast", { event: "screenshare" }, (payload) => {
+      const { userId: fromId, active } = payload.payload as { userId: string; active: boolean };
+      if (fromId === userIdRef.current) return;
+      if (peerIdRef.current && fromId !== peerIdRef.current) return;
+      setPeerScreenSharing(Boolean(active));
+    });
+
     channel.on("broadcast", { event: "signal" }, (payload) => {
       const signal = payload.payload as {
         type: string; sdp?: string; candidate?: RTCIceCandidateInit; senderId?: string;
@@ -1324,6 +1335,9 @@ function ChatRoomContent() {
       const tracks = stream.getTracks();
       console.log("[PeerTalks][WEBRTC] local tracks:", tracks.map((t) => `${t.kind}:${t.readyState}`).join(", "));
       tracks.forEach((track) => pc.addTrack(track, stream));
+      // Remember the camera video track so screen share can replaceTrack back
+      // to it (the screen track swaps out, never adds a second video track).
+      cameraVideoTrackRef.current = stream.getVideoTracks()[0] ?? null;
 
       pcRef.current = pc;
       setJoined(true);
@@ -1458,6 +1472,81 @@ function ChatRoomContent() {
     }
   }, [id]);
 
+  // Screen share: replaceTrack() swaps the camera video track on the EXISTING
+  // sender for a display track — no renegotiation, no glare, and the remote
+  // merged stream keeps exactly one video track, so ontrack logic stays
+  // unambiguous. The browser's own "Stop sharing" control fires 'ended' on
+  // the screen track; that path cleans up identically.
+  const stopScreenShare = useCallback(() => {
+    const pc = pcRef.current;
+    if (pc && cameraVideoTrackRef.current) {
+      const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+      if (sender) {
+        void sender.replaceTrack(cameraVideoTrackRef.current).catch(() => {});
+      }
+    }
+    screenStreamRef.current?.getTracks().forEach((t) => {
+      t.onended = null;
+      t.stop();
+    });
+    screenStreamRef.current = null;
+    setScreenSharing(false);
+    if (signalingChannelRef.current) {
+      signalingChannelRef.current.send({
+        type: "broadcast",
+        event: "screenshare",
+        payload: { userId: userIdRef.current, active: false },
+      }).catch(() => {});
+    }
+  }, []);
+
+  const toggleScreenShare = useCallback(async () => {
+    if (screenSharing) {
+      stopScreenShare();
+      return;
+    }
+    const pc = pcRef.current;
+    if (!pc) {
+      toast.error("Join the call before sharing your screen");
+      return;
+    }
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      toast.error("Screen sharing isn't supported in this browser");
+      return;
+    }
+    const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+    if (!sender) {
+      toast.error("Camera track isn't ready yet");
+      return;
+    }
+    try {
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: 30 },
+        audio: false,
+      });
+      const screenTrack = displayStream.getVideoTracks()[0];
+      if (!screenTrack) {
+        displayStream.getTracks().forEach((t) => t.stop());
+        toast.error("Couldn't capture a screen track");
+        return;
+      }
+      await sender.replaceTrack(screenTrack);
+      screenStreamRef.current = displayStream;
+      // The browser's "Stop sharing" control ends the track — clean up.
+      screenTrack.onended = stopScreenShare;
+      setScreenSharing(true);
+      if (signalingChannelRef.current) {
+        signalingChannelRef.current.send({
+          type: "broadcast",
+          event: "screenshare",
+          payload: { userId: userIdRef.current, active: true },
+        }).catch(() => {});
+      }
+    } catch (err) {
+      // User dismissed the picker — nothing to do.
+    }
+  }, [screenSharing, stopScreenShare, toast]);
+
   const endChat = useCallback(async (goTo: string = "/dashboard") => {
     console.log("[PeerTalks][SESSION] cleanup reason: user ended chat", { sessionId: id });
     sessionEndedRef.current = true;
@@ -1474,6 +1563,7 @@ function ChatRoomContent() {
     }
     void endSessionOnServer();
     stopLocalStream(localStreamRef.current);
+    stopScreenShare();
     pcRef.current?.close();
     pcRef.current = null;
     setRemoteStream((prev) => {
@@ -1482,7 +1572,7 @@ function ChatRoomContent() {
     });
     purgeQueueRows();
     router.push(goTo);
-  }, [router, cleanupChannels, purgeQueueRows, endSessionOnServer, setCallStateSafe, id]);
+  }, [router, cleanupChannels, purgeQueueRows, endSessionOnServer, setCallStateSafe, id, stopScreenShare]);
 
   // Leaving the page without pressing "End chat" (back button, tab close)
   // must still end the session and purge matching rows — otherwise a stale
@@ -1495,9 +1585,16 @@ function ChatRoomContent() {
       if (id) {
         void endSessionOnServer();
         purgeQueueRows();
+        // Leaving mid-call must never keep a screen capture alive — stop the
+        // display stream even if the End chat button was never pressed.
+        screenStreamRef.current?.getTracks().forEach((t) => {
+          t.onended = null;
+          t.stop();
+        });
+        screenStreamRef.current = null;
       }
     };
-  }, [id, purgeQueueRows, endSessionOnServer]);
+  }, [id, purgeQueueRows, endSessionOnServer, stopScreenShare]);
 
   const nextUser = useCallback(() => {
     endChat("/chat/random");
@@ -1910,6 +2007,13 @@ sendingRef.current = false;
               </span>
             </div>
           )}
+          {(screenSharing || peerScreenSharing) && (
+            <div role="status" aria-live="polite" className="absolute top-4 left-4 z-30 pointer-events-none">
+              <span className="text-[11px] uppercase tracking-wider font-medium px-3 py-1.5 rounded-full bg-white/10 text-white/70 border border-white/10">
+                {screenSharing ? "Sharing your screen" : "Screen sharing active"}
+              </span>
+            </div>
+          )}
           <FloatingPreview
             stream={localStream}
             audioEnabled={audioEnabled}
@@ -2070,6 +2174,8 @@ sendingRef.current = false;
         onFullscreen={toggleFullscreen}
         onReport={() => setShowReport(true)}
         onBlock={() => setShowBlockConfirm(true)}
+        onToggleScreenShare={toggleScreenShare}
+        screenSharing={screenSharing}
         showChat={showChat}
       />
 
