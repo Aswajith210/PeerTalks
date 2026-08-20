@@ -6,7 +6,7 @@ import { AuthGuard } from "@/components/auth/AuthGuard";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState, useRef, useCallback, useMemo, memo } from "react";
 import { createClient } from "@/lib/supabase/client";
-import type { Message } from "@/types/database";
+import type { Message, MessageAttachment } from "@/types/database";
 import type { SupabaseClient, RealtimeChannel } from "@supabase/supabase-js";
 import { VideoCard, FloatingPreview, CallControls, JoinScreen, ReactionOverlay, useReactions } from "@/components/video";
 import Icons from "@/components/icons/icons";
@@ -14,6 +14,9 @@ import { startLocalStream, stopLocalStream, toggleTrack } from "@/lib/webrtc/pee
 import { useToast } from "@/hooks/useToast";
 
 const EMOJI_OPTIONS = ["👍", "❤️", "😂", "😮", "😢", "🔥", "🎉", "👏"];
+
+// Attachment size cap (00012) — client-side guard before any upload.
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 
 // Lifecycle timing. These are deliberately separate concerns:
 // - CONNECT_TIMEOUT_MS bounds how long we wait for the FIRST connection.
@@ -94,6 +97,13 @@ function ChatRoomContent() {
   const [lastReadId, setLastReadId] = useState<number | null>(null);
   const lastReadIdRef = useRef<number | null>(null);
   const markReadsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Attachments (00012): committed-only migration, so the ledger is probed
+  // exactly like message_reads — without it the chat stays plain text.
+  const attachmentsEnabledRef = useRef(false);
+  const attachmentsRef = useRef<Map<number, MessageAttachment>>(new Map());
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const attachmentsChannelRef = useRef<RealtimeChannel | null>(null);
   // Auto-scroll: only follow new messages while the user is near the bottom,
   // so scrolling up to read history is never interrupted.
   const lastCountRef = useRef(0);
@@ -133,6 +143,15 @@ function ChatRoomContent() {
     setCallState(s);
     console.log("[PeerTalks][SESSION] state", { sessionId: id, callState: s });
   }, [id]);
+
+  // Fold the attachment ledger row into message rows by message id. Runs at
+  // history load and on every realtime merge so a bubble's chip can never
+  // depend on event ordering between the messages and attachments channels.
+  const attachTo = (rows: Message[]) =>
+    rows.map((m) => {
+      const a = attachmentsRef.current.get(m.id);
+      return a ? { ...m, attachment: a } : m;
+    });
 
   useEffect(() => {
     createClient().then(async (client) => {
@@ -427,7 +446,24 @@ function ChatRoomContent() {
         .order("created_at", { ascending: false })
         .limit(200);
       if (msgs) msgs.reverse();
-      if (!cancelled) setMessages(msgs ?? []);
+      // Attachments (00012): same committed-only pattern as the reads probe —
+      // verify the ledger exists first; without it, no rows are fetched, no
+      // chip ever renders, and the chat behaves exactly as before.
+      const attachProbe = await supabase
+        .from("message_attachments")
+        .select("id", { head: true })
+        .limit(1);
+      if (!attachProbe.error) {
+        attachmentsEnabledRef.current = true;
+        const { data: attRows } = await supabase
+          .from("message_attachments")
+          .select("*")
+          .eq("session_id", id);
+        if (attRows) {
+          for (const a of attRows) attachmentsRef.current.set(a.message_id, a);
+        }
+      }
+      if (!cancelled) setMessages(attachTo(msgs ?? []));
 
       // Load reactions for existing messages
       if (msgs && msgs.length > 0) {
@@ -507,8 +543,10 @@ function ChatRoomContent() {
         setMessages((prev) => {
           const merged = new Map(prev.map((m) => [m.id, m]));
           for (const m of msgs) if (!merged.has(m.id)) merged.set(m.id, m);
-          return [...merged.values()].sort((a, b) =>
-            String(a.created_at).localeCompare(String(b.created_at))
+          return attachTo(
+            [...merged.values()].sort((a, b) =>
+              String(a.created_at).localeCompare(String(b.created_at))
+            )
           );
         });
       };
@@ -529,18 +567,22 @@ function ChatRoomContent() {
               // Dedupe by id: an optimistically-appended sent message and the
               // realtime event for the same row must not appear twice.
               setMessages((prev) =>
-                prev.some((m) => m.id === incoming.id)
-                  ? prev.map((m) => (m.id === incoming.id ? incoming : m))
-                  : [...prev, incoming]
+                attachTo(
+                  prev.some((m) => m.id === incoming.id)
+                    ? prev.map((m) => (m.id === incoming.id ? incoming : m))
+                    : [...prev, incoming]
+                )
               );
             } else if (payload.eventType === "UPDATE") {
               // Soft-delete tombstones arrive here: replace the row so the
               // peer's open chat shows "Message deleted" without reloading.
               const incoming = payload.new as Message;
               setMessages((prev) =>
-                prev.some((m) => m.id === incoming.id)
-                  ? prev.map((m) => (m.id === incoming.id ? incoming : m))
-                  : prev
+                attachTo(
+                  prev.some((m) => m.id === incoming.id)
+                    ? prev.map((m) => (m.id === incoming.id ? incoming : m))
+                    : prev
+                )
               );
             } else if (payload.eventType === "DELETE") {
               const oldRow = payload.old as { id?: number } | null;
@@ -646,14 +688,50 @@ function ChatRoomContent() {
         )
         .subscribe();
 
+      // Attachment ledger rows arrive here so the peer's bubble gets its
+      // chip live. No table filter is possible (rows don't carry a session
+      // id); RLS scopes the payloads. Gated on the schema probe — a
+      // pre-migration DB simply never emits anything.
+      const attachmentsChannel = supabase
+        .channel(`message_attachments:${id}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "message_attachments",
+          },
+          (payload) => {
+            if (!attachmentsEnabledRef.current) return;
+            const row = payload.new as MessageAttachment | null;
+            const oldRow = payload.old as { message_id?: number } | null;
+            const messageId = row?.message_id ?? oldRow?.message_id;
+            if (messageId == null) return;
+            if (payload.eventType === "INSERT" && row) {
+              attachmentsRef.current.set(messageId, row);
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === messageId ? { ...m, attachment: row } : m
+                )
+              );
+            } else if (payload.eventType === "DELETE") {
+              attachmentsRef.current.delete(messageId);
+              setMessages((prev) => prev.map((m) => ({ ...m, attachment: null })));
+            }
+          }
+        )
+        .subscribe();
+
       if (!cancelled) {
         msgChannelRef.current = channel;
         reactionsChannelRef.current = reactionsChannel;
         msgReadsChannelRef.current = readsChannel;
+        attachmentsChannelRef.current = attachmentsChannel;
       } else {
         supabase.removeChannel(channel);
         supabase.removeChannel(reactionsChannel);
         supabase.removeChannel(readsChannel);
+        supabase.removeChannel(attachmentsChannel);
       }
 
       // Fail-safe re-sync: renders and realtime events can be delayed while
@@ -688,6 +766,10 @@ function ChatRoomContent() {
       if (msgReadsChannelRef.current && supabaseRef.current) {
         supabaseRef.current.removeChannel(msgReadsChannelRef.current);
         msgReadsChannelRef.current = null;
+      }
+      if (attachmentsChannelRef.current && supabaseRef.current) {
+        supabaseRef.current.removeChannel(attachmentsChannelRef.current);
+        attachmentsChannelRef.current = null;
       }
       if (markReadsTimerRef.current) {
         clearTimeout(markReadsTimerRef.current);
@@ -1542,7 +1624,7 @@ function ChatRoomContent() {
           payload: { userId: userIdRef.current, active: true },
         }).catch(() => {});
       }
-    } catch (err) {
+    } catch {
       // User dismissed the picker — nothing to do.
     }
   }, [screenSharing, stopScreenShare, toast]);
@@ -1613,8 +1695,11 @@ function ChatRoomContent() {
     // the pre-clear input value and would insert TWO rows (duplicate bubbles
     // on both sides). The ref flips synchronously, before the first await.
     if (sendingRef.current) return;
-    if (!newMessage.trim()) return;
-    const content = newMessage.trim();
+    const file = pendingFile;
+    if (!newMessage.trim() && !file) return;
+    // Attachment messages carry the file name as their text content, so the
+    // bubble stays meaningful even if the upload/ledger path degrades.
+    const content = file ? `📎 ${file.name}` : newMessage.trim();
     sendingRef.current = true;
     setNewMessage("");
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -1656,8 +1741,61 @@ function ChatRoomContent() {
       // dedupes by id, so this cannot double-render.
       if (inserted) {
         setMessages((prev) =>
-          prev.some((m) => m.id === inserted.id) ? prev : [...prev, inserted]
+          attachTo(
+            prev.some((m) => m.id === inserted.id) ? prev : [...prev, inserted]
+          )
         );
+      }
+      // Attachment upload (00012): message-first ordering — a failing upload
+      // or ledger insert can never lose the message; the bubble just stays a
+      // plain filename message. Skipped entirely when the migration isn't
+      // applied (the schema probe owns that flag).
+      if (inserted && file) {
+        setPendingFile(null);
+        if (attachmentsEnabledRef.current) {
+          const safeName = file.name.replace(/[/\\]/g, "_");
+          const storagePath = `${id}/${inserted.id}/${safeName}`;
+          const up = await s.storage
+            .from("chat-attachments")
+            .upload(storagePath, file, { contentType: file.type || undefined });
+          if (up.error) {
+            console.error("[PeerTalks][ATTACH] upload failed", {
+              sessionId: id, messageId: inserted.id, message: up.error.message,
+            });
+            toast.error("Attachment couldn't be uploaded — message sent without it");
+          } else {
+            const { data: ledger, error: ledErr } = await s
+              .from("message_attachments")
+              .insert({
+                message_id: inserted.id,
+                session_id: id,
+                uploader_id: user.id,
+                file_name: file.name,
+                file_size: file.size,
+                mime_type: file.type || null,
+                storage_path: storagePath,
+              })
+              .select()
+              .single();
+            if (ledErr || !ledger) {
+              console.error("[PeerTalks][ATTACH] ledger insert failed", {
+                sessionId: id,
+                messageId: inserted.id,
+                message: ledErr?.message ?? "no row returned",
+              });
+              toast.error("Attachment couldn't be saved — message sent without it");
+              // Avoid orphaned objects in the bucket.
+              s.storage.from("chat-attachments").remove([storagePath]).catch(() => {});
+            } else {
+              attachmentsRef.current.set(inserted.id, ledger);
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === inserted.id ? { ...m, attachment: ledger } : m
+                )
+              );
+            }
+          }
+        }
       }
     } catch (e) {
       console.error("[PeerTalks][MESSAGES] insert failed", {
@@ -1698,7 +1836,34 @@ sendingRef.current = false;
           : m
       )
     );
+    // Attachment objects (00012) are not removed by the soft-delete tombstone
+    // — clean up the storage object best-effort so a deleted message doesn't
+    // keep its file around forever.
+    const att = attachmentsRef.current.get(messageId);
+    if (att) {
+      s.storage.from("chat-attachments").remove([att.storage_path]).catch(() => {});
+    }
   }, [toast, id]);
+
+  // Attachment download (00012): private bucket, so open a short-lived
+  // signed URL in a new tab. Only reachable when the ledger exists.
+  const downloadAttachment = useCallback(async (msg: Message) => {
+    const s = getSupabase();
+    if (!s || !msg.attachment) return;
+    const { data, error } = await s.storage
+      .from("chat-attachments")
+      .createSignedUrl(msg.attachment.storage_path, 60);
+    if (error || !data?.signedUrl) {
+      console.error("[PeerTalks][ATTACH] signed URL failed", {
+        sessionId: msg.session_id,
+        messageId: msg.id,
+        message: error?.message ?? "no URL",
+      });
+      toast.error("Couldn't open the attachment");
+      return;
+    }
+    window.open(data.signedUrl, "_blank", "noopener");
+  }, [toast]);
 
   // Unread badge (00013): incoming messages newer than my last-read marker.
   const unreadCount = useMemo(() => {
@@ -1871,6 +2036,7 @@ sendingRef.current = false;
               onReact={toggleMessageReaction}
               seen={msg.sender_id === myUserId && seenByPeer.has(msg.id)}
               onDelete={msg.sender_id === myUserId ? deleteMessage : undefined}
+              onDownload={downloadAttachment}
             />
           ))}
           {peerTyping && (
@@ -1885,7 +2051,43 @@ sendingRef.current = false;
         </div>
         <div className="p-3 border-t border-white/[0.04]">
           {emojiPickerOpen && <EmojiPicker onPick={(e) => setNewMessage((v) => v + e)} />}
+          {pendingFile && (
+            <div className="mb-2 flex items-center gap-2 px-3 py-2 rounded-xl glass-strong text-xs text-white/60">
+              <span className="truncate max-w-[240px]">📎 {pendingFile.name}</span>
+              <button
+                onClick={() => setPendingFile(null)}
+                className="ml-auto text-white/30 hover:text-white/70"
+                aria-label="Remove attachment"
+              >
+                <Icons.Close size={12} />
+              </button>
+            </div>
+          )}
           <div className="flex gap-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0] ?? null;
+                if (f) {
+                  if (f.size > MAX_ATTACHMENT_BYTES) {
+                    toast.error("File too large — max 10 MB");
+                  } else {
+                    setPendingFile(f);
+                  }
+                }
+                e.target.value = "";
+              }}
+            />
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="w-11 h-11 rounded-xl glass-strong flex items-center justify-center hover:bg-white/[0.08] transition-all duration-200 shrink-0"
+              aria-label="Attach file"
+              title="Attach file (max 10 MB)"
+            >
+              <Icons.Paperclip size={15} />
+            </button>
             <button
               onClick={() => setEmojiPickerOpen((v) => !v)}
               className="w-11 h-11 rounded-xl glass-strong flex items-center justify-center hover:bg-white/[0.08] transition-all duration-200 shrink-0"
@@ -1913,7 +2115,7 @@ sendingRef.current = false;
             />
             <button
               onClick={sendMessage}
-              disabled={!newMessage.trim()}
+              disabled={!newMessage.trim() && !pendingFile}
               className="w-11 h-11 rounded-xl glass-strong flex items-center justify-center disabled:opacity-30 hover:bg-white/[0.08] transition-all duration-200 shrink-0"
               aria-label="Send message"
             >
@@ -2070,6 +2272,7 @@ sendingRef.current = false;
                   onReact={toggleMessageReaction}
                   seen={msg.sender_id === myUserId && seenByPeer.has(msg.id)}
                   onDelete={msg.sender_id === myUserId ? deleteMessage : undefined}
+                  onDownload={downloadAttachment}
                 />
               ))}
               {peerTyping && (
@@ -2084,7 +2287,43 @@ sendingRef.current = false;
             </div>
             <div className="p-3 border-t border-white/[0.04]">
               {emojiPickerOpen && <EmojiPicker onPick={(e) => setNewMessage((v) => v + e)} />}
+              {pendingFile && (
+                <div className="mb-2 flex items-center gap-2 px-3 py-2 rounded-xl glass-strong text-xs text-white/60">
+                  <span className="truncate max-w-[240px]">📎 {pendingFile.name}</span>
+                  <button
+                    onClick={() => setPendingFile(null)}
+                    className="ml-auto text-white/30 hover:text-white/70"
+                    aria-label="Remove attachment"
+                  >
+                    <Icons.Close size={12} />
+                  </button>
+                </div>
+              )}
               <div className="flex gap-2">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0] ?? null;
+                    if (f) {
+                      if (f.size > MAX_ATTACHMENT_BYTES) {
+                        toast.error("File too large — max 10 MB");
+                      } else {
+                        setPendingFile(f);
+                      }
+                    }
+                    e.target.value = "";
+                  }}
+                />
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  className="w-11 h-11 rounded-xl glass-strong flex items-center justify-center hover:bg-white/[0.08] transition-all duration-200 shrink-0"
+                  aria-label="Attach file"
+                  title="Attach file (max 10 MB)"
+                >
+                  <Icons.Paperclip size={15} />
+                </button>
                 <button
                   onClick={() => setEmojiPickerOpen((v) => !v)}
                   className="w-11 h-11 rounded-xl glass-strong flex items-center justify-center hover:bg-white/[0.08] transition-all duration-200 shrink-0"
@@ -2112,7 +2351,7 @@ sendingRef.current = false;
                 />
                 <button
                   onClick={sendMessage}
-                  disabled={!newMessage.trim()}
+                  disabled={!newMessage.trim() && !pendingFile}
                   className="w-11 h-11 rounded-xl glass-strong flex items-center justify-center disabled:opacity-30 hover:bg-white/[0.08] transition-all duration-200 shrink-0"
                   aria-label="Send message"
                 >
@@ -2192,13 +2431,14 @@ sendingRef.current = false;
   );
 }
 
-const MessageBubble = memo(function MessageBubble({ msg, mine, reactions, onReact, seen, onDelete }: {
+const MessageBubble = memo(function MessageBubble({ msg, mine, reactions, onReact, seen, onDelete, onDownload }: {
   msg: Message;
   mine: boolean;
   reactions?: Record<string, { count: number; mine: boolean }>;
   onReact: (messageId: number, emoji: string) => void;
   seen?: boolean;
   onDelete?: (messageId: number) => void;
+  onDownload?: (msg: Message) => void;
 }) {
   if (msg.deleted_at) {
     return (
@@ -2223,6 +2463,18 @@ const MessageBubble = memo(function MessageBubble({ msg, mine, reactions, onReac
         <div className={`px-4 py-2.5 rounded-2xl text-sm text-white/80 whitespace-pre-wrap break-words ${mine ? "bg-white/20" : "bg-white/10"}`}>
           {msg.content}
         </div>
+        {msg.attachment && (
+          <button
+            onClick={() => onDownload?.(msg)}
+            className="mt-2 flex items-center gap-2 rounded-xl px-3 py-2 text-xs border border-white/10 bg-white/[0.06] hover:bg-white/10 transition-all duration-150"
+            aria-label={`Download ${msg.attachment.file_name}`}
+            title={`Download ${msg.attachment.file_name}`}
+          >
+            <Icons.Download size={13} />
+            <span className="max-w-[180px] truncate">{msg.attachment.file_name}</span>
+            <span className="text-white/35 shrink-0">{formatBytes(msg.attachment.file_size)}</span>
+          </button>
+        )}
         {mine && onDelete && (
           <button
             onClick={() => onDelete(msg.id)}
@@ -2263,6 +2515,12 @@ const MessageBubble = memo(function MessageBubble({ msg, mine, reactions, onReac
     </div>
   );
 });
+
+function formatBytes(n: number) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 function EmojiPicker({ onPick }: { onPick: (emoji: string) => void }) {
   return (

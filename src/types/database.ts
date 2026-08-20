@@ -111,6 +111,21 @@ export interface Message {
   // bubble renders "Message deleted" instead of the content.
   deleted_at?: string | null;
   deleted_by?: string | null;
+  // Attachment ledger row (00012), folded in client-side for the bubble.
+  // Absent when the migration isn't applied — the chat works as before.
+  attachment?: MessageAttachment | null;
+}
+
+export interface MessageAttachment {
+  id: number;
+  message_id: number;
+  session_id: string;
+  uploader_id: string | null;
+  file_name: string;
+  file_size: number;
+  mime_type: string | null;
+  storage_path: string;
+  created_at: string;
 }
 
 export interface PrivateRoom {

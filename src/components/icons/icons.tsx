@@ -285,6 +285,20 @@ const VolumeOff = (props: IconProps) => (
   </GlassIcon>
 );
 
+const Paperclip = (props: IconProps) => (
+  <GlassIcon {...props}>
+    <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+  </GlassIcon>
+);
+
+const Download = (props: IconProps) => (
+  <GlassIcon {...props}>
+    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+    <path d="M7 10l5 5 5-5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+    <path d="M12 15V3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+  </GlassIcon>
+);
+
 const Wifi = (props: IconProps) => (
   <GlassIcon {...props}>
     <path d="M5 12.55a11 11 0 0114.08 0" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" fill="none" opacity={0.7} />
@@ -331,6 +345,8 @@ const Icons = {
   Volume,
   VolumeOff,
   Wifi,
+  Paperclip,
+  Download,
 } as const;
 
 export type IconName = keyof typeof Icons;
