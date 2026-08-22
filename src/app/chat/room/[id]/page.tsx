@@ -26,6 +26,10 @@ const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 // indicator is driven by stream presence, not by a timer.
 const CONNECT_TIMEOUT_MS = 60000;
 const RECONNECT_GRACE_MS = 20000;
+// A known connection may drop and recover (mobile blips) — but never in an
+// unbounded cycle: after MAX_RECONNECT_ATTEMPTS failed recovery windows the
+// call is treated as lost instead of looping "Reconnecting…" forever.
+const MAX_RECONNECT_ATTEMPTS = 3;
 
 type CallState =
   | "idle"
@@ -76,6 +80,9 @@ function ChatRoomContent() {
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [videoEnabled, setVideoEnabled] = useState(true);
   const [connectionState, setConnectionState] = useState<string>("new");
+  // Derived from getStats RTT while connected (Excellent/Good/Weak) —
+  // shown as a subtle pill so users can tell a weak link from a dead one.
+  const [callQuality, setCallQuality] = useState<"excellent" | "good" | "weak" | null>(null);
   const [showChat, setShowChat] = useState(false);
   const [joined, setJoined] = useState(false);
   const [isJoining, setIsJoining] = useState(false);
@@ -164,6 +171,17 @@ function ChatRoomContent() {
   const signalQueueRef = useRef<Promise<void>>(Promise.resolve());
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const seenCandidatesRef = useRef<Set<string>>(new Set());
+  // Candidates gathered while the signaling channel has NOT joined yet.
+  // Realtime broadcasts are never replayed, and the first host candidates
+  // gather in ms — long before the channel subscribes — so without a buffer
+  // they are silently dropped and the answerer never learns our host/IP.
+  const pendingOutboundCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  // Recovery budget: counts completed reconnect grace windows. Reset on a
+  // successful connect; the session ends after MAX_RECONNECT_ATTEMPTS.
+  const reconnectAttemptsRef = useRef(0);
+  // One re-acquire attempt per media kind per call (device removal).
+  const mediaRetryRef = useRef<{ audio: boolean; video: boolean }>({ audio: false, video: false });
+  const screenSharingRef = useRef(false);
 
   const setCallStateSafe = useCallback((s: CallState) => {
     callStateRef.current = s;
@@ -266,6 +284,25 @@ function ChatRoomContent() {
   const resetCandidateState = useCallback(() => {
     pendingCandidatesRef.current = [];
     seenCandidatesRef.current.clear();
+  }, []);
+
+  // Send every candidate buffered before the channel joined. Called from the
+  // SUBSCRIBED callback and defensively before each offer send — idempotent,
+  // and the dedupe set on the receiving side keeps resends harmless.
+  const flushOutboundCandidates = useCallback(() => {
+    const ch = signalingChannelRef.current;
+    if (!ch || ch.state !== "joined") return;
+    const buffered = pendingOutboundCandidatesRef.current;
+    if (buffered.length === 0) return;
+    pendingOutboundCandidatesRef.current = [];
+    buffered.forEach((candidate) => {
+      ch.send({
+        type: "broadcast",
+        event: "signal",
+        payload: { type: "ice-candidate", candidate, senderId: userIdRef.current },
+      }).catch(() => {});
+    });
+    console.log("[PeerTalks][ICE] flushed pre-join candidates", { count: buffered.length });
   }, []);
 
   const scrollToBottom = () => {
@@ -989,10 +1026,23 @@ function ChatRoomContent() {
     const pc = pcRef.current;
     if (!pc || pc.connectionState === "closed" || sessionEndedRef.current) return;
     if (callStateRef.current === "ended" || callStateRef.current === "reconnecting") return;
+    // Bounded recovery: each drop costs one attempt; after the budget is
+    // exhausted the call ends instead of re-entering the grace window
+    // forever on a flapping network.
+    reconnectAttemptsRef.current += 1;
+    const attempt = reconnectAttemptsRef.current;
     console.log("[PeerTalks][SESSION] connection lost - reconnecting", {
+      attempt,
+      maxAttempts: MAX_RECONNECT_ATTEMPTS,
       connectionState: pc.connectionState,
       iceConnectionState: pc.iceConnectionState,
     });
+    if (attempt > MAX_RECONNECT_ATTEMPTS) {
+      console.log("[PeerTalks][SESSION] reconnect budget exhausted - ending call");
+      setPeerLeftReason("The connection to your partner was lost");
+      handlePeerLeft();
+      return;
+    }
     setCallStateSafe("reconnecting");
     // Restart ICE (triggers negotiationneeded) and, on the offerer side,
     // resume the offer retry loop so the recovery offer is actually sent.
@@ -1107,7 +1157,20 @@ function ChatRoomContent() {
                 await pc.setLocalDescription({ type: "rollback" });
               } catch {}
               await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: signal.sdp! }));
+            } else if (pc.signalingState === "have-remote-offer") {
+              // A second offer while the first is still being answered can
+              // only be a duplicate or replacement (the serialized queue
+              // guarantees the first offer was already applied). Applying it
+              // directly would throw InvalidStateError and stall the call —
+              // roll the in-flight answer back and adopt the NEWER offer.
+              console.log("[PeerTalks][SIGNALING] offer received while answering - replacing");
+              try {
+                await pc.setLocalDescription({ type: "rollback" });
+              } catch {}
+              await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: signal.sdp! }));
             } else {
+              // stable (first offer / renegotiation) or have-local-answer
+              // (newer offer after an answer — legal; re-answered below).
               await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: signal.sdp! }));
             }
             // New generation: candidates queued before the offer belong to it.
@@ -1164,19 +1227,33 @@ function ChatRoomContent() {
         console.log("[PeerTalks][WEBRTC] ice candidate gathered", {
           type: event.candidate.type,
           protocol: event.candidate.protocol,
+          channelState: channel.state,
         });
       }
-      if (event.candidate && channel.state === "joined") {
+      if (!event.candidate) return;
+      // Candidates gathered BEFORE the channel joins are otherwise dropped
+      // forever (broadcasts aren't replayed) — buffer them for the flush on
+      // SUBSCRIBED instead. Same-network host candidates gather in ms and hit
+      // this window constantly.
+      if (channel.state === "joined") {
         channel.send({
           type: "broadcast",
           event: "signal",
           payload: { type: "ice-candidate", candidate: event.candidate.toJSON(), senderId: userIdRef.current },
         }).catch(() => {});
+      } else {
+        pendingOutboundCandidatesRef.current.push(event.candidate.toJSON());
+        console.log("[PeerTalks][ICE] candidate buffered until channel joins", {
+          buffered: pendingOutboundCandidatesRef.current.length,
+        });
       }
     };
 
     await channel.subscribe((status) => {
       console.log("[PeerTalks][SIGNALING] channel status", { sessionId: id, status });
+      if (status === "SUBSCRIBED") {
+        flushOutboundCandidates();
+      }
     });
     // The chat may have ended while the channel was connecting — never
     // register a channel or start the offer loop after cleanup ran.
@@ -1196,6 +1273,9 @@ function ChatRoomContent() {
         // The chat may have ended while the pre-offer wait was pending —
         // never resurrect the retry loop on a closed/detached peer connection.
         if (sessionEndedRef.current || pcRef.current !== pc || pc.connectionState === "closed") return;
+        // Defensive flush: if the SUBSCRIBED callback was missed, candidates
+        // buffered pre-join still ride along with the first offer.
+        flushOutboundCandidates();
         if (answerReceivedRef.current || pc.connectionState === "connected") {
           if (offerTimerRef.current) {
             clearInterval(offerTimerRef.current);
@@ -1251,7 +1331,7 @@ function ChatRoomContent() {
       };
       startOfferLoopRef.current();
     }
-  }, [id, addReaction, handlePeerLeft, enqueueSignal, enqueueCandidate, flushQueuedCandidates, resetCandidateState, triggerOverlay]);
+  }, [id, addReaction, handlePeerLeft, enqueueSignal, enqueueCandidate, flushQueuedCandidates, resetCandidateState, flushOutboundCandidates, triggerOverlay]);
 
   const handleJoin = useCallback(async () => {
     // Guard against a double-click / double-invocation: a second
@@ -1416,6 +1496,7 @@ function ChatRoomContent() {
         if (st === "connected") {
           setPeerLeft(false);
           setCallStateSafe("connected");
+          reconnectAttemptsRef.current = 0;
           if (offerTimerRef.current) {
             clearInterval(offerTimerRef.current);
             offerTimerRef.current = null;
@@ -1444,6 +1525,52 @@ function ChatRoomContent() {
       const tracks = stream.getTracks();
       console.log("[PeerTalks][WEBRTC] local tracks:", tracks.map((t) => `${t.kind}:${t.readyState}`).join(", "));
       tracks.forEach((track) => pc.addTrack(track, stream));
+      // Device removal (unplugged camera/mic, disabled device): the track
+      // fires 'ended'. Recover ONCE per kind per call by re-acquiring media
+      // and replaceTrack()-ing the sender — no renegotiation, the peer never
+      // notices. A second failure keeps the call running with a notice.
+      tracks.forEach((track) => {
+        if (track.kind !== "audio" && track.kind !== "video") return;
+        const kind = track.kind as "audio" | "video";
+        track.onended = () => {
+          if (sessionEndedRef.current || pcRef.current !== pc || pc.connectionState === "closed") return;
+          if (kind === "video" && screenSharingRef.current) return;
+          if (mediaRetryRef.current[kind]) return;
+          mediaRetryRef.current[kind] = true;
+          const label = kind === "audio" ? "microphone" : "camera";
+          console.log("[PeerTalks][MEDIA] local track ended - re-acquiring", { kind });
+          startLocalStream(
+            kind === "audio"
+              ? { video: false, audio: true }
+              : { audio: false, video: { width: { ideal: 1280, max: 1280 }, height: { ideal: 720, max: 720 } } }
+          )
+            .then(async (newStream) => {
+              if (!newStream || sessionEndedRef.current || pcRef.current !== pc) return;
+              const newTrack = newStream.getTracks()[0];
+              const sender = pc.getSenders().find((s) => s.track?.kind === kind);
+              if (!sender || !newTrack) return;
+              await sender.replaceTrack(newTrack);
+              if (kind === "video") {
+                cameraVideoTrackRef.current = newTrack;
+              }
+              const ls = localStreamRef.current;
+              if (ls) {
+                ls.getTracks()
+                  .filter((t) => t.kind === kind)
+                  .forEach((t) => {
+                    t.stop();
+                    ls.removeTrack(t);
+                  });
+                ls.addTrack(newTrack);
+              }
+              console.log("[PeerTalks][MEDIA] track recovered", { kind });
+            })
+            .catch((e) => {
+              console.warn("[PeerTalks][MEDIA] track recovery failed", { kind, error: e });
+              toast.error(`Couldn't recover your ${label} — check your devices`);
+            });
+        };
+      });
       // Remember the camera video track so screen share can replaceTrack back
       // to it (the screen track swaps out, never adds a second video track).
       cameraVideoTrackRef.current = stream.getVideoTracks()[0] ?? null;
@@ -1512,7 +1639,7 @@ function ChatRoomContent() {
       setIsJoining(false);
       joiningRef.current = false;
     }
-  }, [callType, id, initiateSignaling, enterReconnecting, setCallStateSafe, resetCandidateState]);
+  }, [callType, id, initiateSignaling, enterReconnecting, setCallStateSafe, resetCandidateState, toast]);
 
   const cleanupChannels = useCallback(() => {
     const supabase = getSupabase();
@@ -1591,7 +1718,10 @@ function ChatRoomContent() {
     if (pc && cameraVideoTrackRef.current) {
       const sender = pc.getSenders().find((s) => s.track?.kind === "video");
       if (sender) {
-        void sender.replaceTrack(cameraVideoTrackRef.current).catch(() => {});
+        void sender.replaceTrack(cameraVideoTrackRef.current).catch((e) => {
+          console.warn("[PeerTalks][MEDIA] restore camera failed", e);
+          toast.error("Couldn't restore your camera — rejoin the call to continue");
+        });
       }
     }
     screenStreamRef.current?.getTracks().forEach((t) => {
@@ -1600,6 +1730,7 @@ function ChatRoomContent() {
     });
     screenStreamRef.current = null;
     setScreenSharing(false);
+    screenSharingRef.current = false;
     if (signalingChannelRef.current) {
       signalingChannelRef.current.send({
         type: "broadcast",
@@ -1607,7 +1738,7 @@ function ChatRoomContent() {
         payload: { userId: userIdRef.current, active: false },
       }).catch(() => {});
     }
-  }, []);
+  }, [toast]);
 
   const toggleScreenShare = useCallback(async () => {
     if (screenSharing) {
@@ -1639,11 +1770,17 @@ function ChatRoomContent() {
         toast.error("Couldn't capture a screen track");
         return;
       }
-      await sender.replaceTrack(screenTrack);
+      await sender.replaceTrack(screenTrack).catch((e) => {
+        console.error("[PeerTalks][MEDIA] screen share replaceTrack failed", e);
+        displayStream.getTracks().forEach((t) => t.stop());
+        toast.error("Couldn't switch your camera to the screen — try again");
+        throw e;
+      });
       screenStreamRef.current = displayStream;
       // The browser's "Stop sharing" control ends the track — clean up.
       screenTrack.onended = stopScreenShare;
       setScreenSharing(true);
+      screenSharingRef.current = true;
       if (signalingChannelRef.current) {
         signalingChannelRef.current.send({
           type: "broadcast",
@@ -1704,6 +1841,66 @@ function ChatRoomContent() {
       }
     };
   }, [id, purgeQueueRows, endSessionOnServer, stopScreenShare]);
+
+  // Tab close / full-page navigation: React unmount never runs while the
+  // browser tears the page down, so the keepalive end-session request and the
+  // peerleft broadcast go out here instead — otherwise the peer is stranded
+  // on an open call and the session row stays "connected" until the API
+  // sidecar notices. Guarded by sessionEndedRef so endChat/unmount win.
+  useEffect(() => {
+    const onPageHide = () => {
+      if (sessionEndedRef.current || !id) return;
+      sessionEndedRef.current = true;
+      console.log("[PeerTalks][SESSION] page hidden - ending session", { sessionId: id });
+      void endSessionOnServer();
+      purgeQueueRows();
+      if (signalingChannelRef.current) {
+        signalingChannelRef.current.send({
+          type: "broadcast",
+          event: "peerleft",
+          payload: { userId: userIdRef.current },
+        }).catch(() => {});
+      }
+    };
+    window.addEventListener("pagehide", onPageHide);
+    return () => window.removeEventListener("pagehide", onPageHide);
+  }, [id, endSessionOnServer, purgeQueueRows]);
+
+  // Call-quality indicator: poll getStats for the succeeded candidate pair's
+  // RTT while connected. Sub-150ms = Excellent, sub-400ms = Good, anything
+  // slower (or no succeeded pair yet) = Weak. Stops as soon as the call
+  // leaves the connected state — no leaked timers. The pill render is gated
+  // on callState === "connected", so no synchronous reset is needed here.
+  useEffect(() => {
+    if (callState !== "connected") return;
+    let cancelled = false;
+    const poll = async () => {
+      const pc = pcRef.current;
+      if (!pc || pc.connectionState !== "connected") return;
+      try {
+        const stats = await pc.getStats();
+        let rtt: number | null = null;
+        stats.forEach((s) => {
+          if (
+            s.type === "candidate-pair" &&
+            s.state === "succeeded" &&
+            typeof s.currentRoundTripTime === "number" &&
+            s.currentRoundTripTime > 0
+          ) {
+            rtt = s.currentRoundTripTime * 1000;
+          }
+        });
+        if (cancelled) return;
+        setCallQuality(rtt === null ? "weak" : rtt < 150 ? "excellent" : rtt < 400 ? "good" : "weak");
+      } catch {}
+    };
+    poll();
+    const interval = setInterval(poll, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [callState]);
 
   const nextUser = useCallback(() => {
     endChat("/chat/random");
@@ -2234,6 +2431,32 @@ sendingRef.current = false;
             <div role="status" aria-live="polite" className="absolute top-4 left-1/2 -translate-x-1/2 z-30 pointer-events-none">
               <span className="text-[11px] uppercase tracking-wider font-medium px-3 py-1.5 rounded-full bg-warning-soft text-warning border border-warning/20">
                 Reconnecting…
+              </span>
+            </div>
+          )}
+          {callState === "connected" && callQuality && (
+            <div
+              role="status"
+              aria-label={`Call quality: ${callQuality}`}
+              className="absolute bottom-4 left-4 z-30 pointer-events-none"
+            >
+              <span
+                className={
+                  "text-[10px] uppercase tracking-wider font-medium px-2.5 py-1 rounded-full border flex items-center gap-1.5 " +
+                  (callQuality === "excellent"
+                    ? "bg-success-soft text-success border-success/20"
+                    : callQuality === "good"
+                    ? "bg-white/10 text-white/70 border-white/10"
+                    : "bg-warning-soft text-warning border-warning/20")
+                }
+              >
+                <span
+                  className={
+                    "w-1.5 h-1.5 rounded-full " +
+                    (callQuality === "excellent" ? "bg-success" : callQuality === "good" ? "bg-white/50" : "bg-warning")
+                  }
+                />
+                {callQuality === "excellent" ? "Excellent" : callQuality === "good" ? "Good" : "Weak"}
               </span>
             </div>
           )}
