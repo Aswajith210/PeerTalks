@@ -147,6 +147,9 @@ function ChatRoomContent() {
   const sessionEndedRef = useRef(false);
   const offerTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const connectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // In-flight attachment upload tracker: prevents duplicate uploads when the
+  // user triggers a new send while an earlier upload is still pending.
+  const inFlightUploadsRef = useRef<Set<number>>(new Set());
   const answerReceivedRef = useRef(false);
   const typingSentAtRef = useRef(0);
   const typingClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -637,6 +640,11 @@ function ChatRoomContent() {
                     : [...prev, incoming]
                 )
               );
+              // Auto-scroll when the user is already near the bottom so the
+              // new message becomes visible without an abrupt jump.
+              if (nearBottomRef.current) {
+                scrollToBottom();
+              }
             } else if (payload.eventType === "UPDATE") {
               // Soft-delete tombstones arrive here: replace the row so the
               // peer's open chat shows "Message deleted" without reloading.
@@ -1972,48 +1980,62 @@ function ChatRoomContent() {
       // plain filename message. Skipped entirely when the migration isn't
       // applied (the schema probe owns that flag).
       if (inserted && file) {
-        setPendingFile(null);
-        if (attachmentsEnabledRef.current) {
-          const safeName = file.name.replace(/[/\\]/g, "_");
-          const storagePath = `${id}/${inserted.id}/${safeName}`;
-          const up = await s.storage
-            .from("chat-attachments")
-            .upload(storagePath, file, { contentType: file.type || undefined });
-          if (up.error) {
-            console.error("[PeerTalks][ATTACH] upload failed", {
-              sessionId: id, messageId: inserted.id, message: up.error.message,
-            });
-            toast.error("Attachment couldn't be uploaded — message sent without it");
-          } else {
-            const { data: ledger, error: ledErr } = await s
-              .from("message_attachments")
-              .insert({
-                message_id: inserted.id,
-                session_id: id,
-                uploader_id: user.id,
-                file_name: file.name,
-                file_size: file.size,
-                mime_type: file.type || null,
-                storage_path: storagePath,
-              })
-              .select()
-              .single();
-            if (ledErr || !ledger) {
-              console.error("[PeerTalks][ATTACH] ledger insert failed", {
-                sessionId: id,
-                messageId: inserted.id,
-                message: ledErr?.message ?? "no row returned",
+        // Duplicate-prevention: skip upload if one is already in-flight for this message.
+        if (inFlightUploadsRef.current.has(inserted.id)) {
+          toast.error("Attachment upload already in progress — skipping duplicate.");
+          setPendingFile(null);
+        } else {
+          inFlightUploadsRef.current.add(inserted.id);
+          setPendingFile(null);
+          if (attachmentsEnabledRef.current) {
+            const safeName = file.name.replace(/[/\\]/g, "_");
+            const storagePath = `${id}/${inserted.id}/${safeName}`;
+            const up = await s.storage
+              .from("chat-attachments")
+              .upload(storagePath, file, { contentType: file.type || undefined });
+            // Remove from in-flight tracker on upload completion (success or error).
+            const cleanup = async () => {
+              inFlightUploadsRef.current.delete(inserted.id);
+            };
+            if (up.error) {
+              console.error("[PeerTalks][ATTACH] upload failed", {
+                sessionId: id, messageId: inserted.id, message: up.error.message,
               });
-              toast.error("Attachment couldn't be saved — message sent without it");
-              // Avoid orphaned objects in the bucket.
-              s.storage.from("chat-attachments").remove([storagePath]).catch(() => {});
+              toast.error("Attachment couldn't be uploaded — message sent without it");
+              await cleanup();
             } else {
-              attachmentsRef.current.set(inserted.id, ledger);
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === inserted.id ? { ...m, attachment: ledger } : m
-                )
-              );
+              const { data: ledger, error: ledErr } = await s
+                .from("message_attachments")
+                .insert({
+                  message_id: inserted.id,
+                  session_id: id,
+                  uploader_id: user.id,
+                  file_name: file.name,
+                  file_size: file.size,
+                  mime_type: file.type || null,
+                  storage_path: storagePath,
+                })
+                .select()
+                .single();
+              if (ledErr || !ledger) {
+                console.error("[PeerTalks][ATTACH] ledger insert failed", {
+                  sessionId: id,
+                  messageId: inserted.id,
+                  message: ledErr?.message ?? "no row returned",
+                });
+                toast.error("Attachment couldn't be saved — message sent without it");
+                // Avoid orphaned objects in the bucket.
+                s.storage.from("chat-attachments").remove([storagePath]).catch(() => {});
+                await cleanup();
+              } else {
+                attachmentsRef.current.set(inserted.id, ledger);
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === inserted.id ? { ...m, attachment: ledger } : m
+                  )
+                );
+                await cleanup();
+              }
             }
           }
         }
@@ -2024,7 +2046,6 @@ function ChatRoomContent() {
         message: e instanceof Error ? e.message : String(e),
       });
       toast.error("Message didn't send — tap send to retry");
-      setNewMessage(content);
     } finally {
       if (timer) clearTimeout(timer);
 sendingRef.current = false;
@@ -2714,7 +2735,7 @@ const MessageBubble = memo(function MessageBubble({ msg, mine, reactions, onReac
         <div className={`px-4 py-2.5 rounded-2xl text-sm text-white/80 whitespace-pre-wrap break-words ${mine ? "bg-white/20" : "bg-white/10"}`}>
           {msg.content}
         </div>
-        {msg.attachment && (
+        {msg.attachment && !msg.deleted_at && (
           <button
             onClick={() => onDownload?.(msg)}
             className="mt-2 flex items-center gap-2 rounded-xl px-3 py-2 text-xs border border-white/10 bg-white/[0.06] hover:bg-white/10 transition-all duration-150"
