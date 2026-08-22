@@ -88,9 +88,9 @@ async function tryDirectMatch(
     if (b.blocked_id !== userId) blocked.add(b.blocked_id);
   }
 
-  const { data: existing } = await admin
+const { data: existing } = await admin
     .from("matching_queue")
-    .select("id, user_id, interests")
+    .select("id, user_id, interests, status")
     .eq("mode", "interest")
     .eq("call_type", callType)
     .eq("status", "waiting")
@@ -102,16 +102,50 @@ async function tryDirectMatch(
     if (blocked.has(e.user_id)) return false;
     const theirs = (e.interests as string[] | null) ?? [];
     return theirs.some((t) => mine.has(t.toLowerCase().trim()));
-  });
-
+  }) ?? null;
   if (!candidate) return { matched: false };
+
+  // Safety: if the candidate's row is no longer "waiting" (e.g. already
+  // matched by a concurrent direct-match or RPC), abort this attempt.
+  if (candidate.status !== "waiting") return { matched: false };
+
+  // Fix: lock the candidate's waiting row before inserting a session, to
+  // prevent two parallel direct-match requests from both succeeding.
+  // Crucial: .eq("status", "waiting") ensures this UPDATE only succeeds if
+  // the row is still in the expected state. If another request already changed
+  // the status, this UPDATE affects 0 rows and .single() throws, which we
+  // catch below to return { matched: false } safely.
+  try {
+    await admin
+      .from("matching_queue")
+      .update({
+        status: "matched", matched_user_id: userId,
+        session_id: null, matched_at: null,
+      })
+      .eq("id", candidate.id)
+      .eq("status", "waiting")  // <--- ONLY update if still waiting
+      .select()
+      .single();
+  } catch {
+    // The row was no longer "waiting" (concurrent request already matched it).
+    return { matched: false };
+  }
 
   const { data: chat } = await admin
     .from("chat_sessions")
     .insert({ mode: "interest", status: "connected", call_type: callType, user1_id: candidate.user_id, user2_id: userId })
     .select("id")
     .single();
-  if (!chat) return { matched: false };
+  if (!chat) {
+    // Roll back the lock
+    await admin
+      .from("matching_queue")
+      .update({
+        status: "waiting", matched_user_id: null, session_id: null, matched_at: null,
+      })
+      .eq("id", candidate.id);
+    return { matched: false };
+  }
 
   await admin
     .from("matching_queue")

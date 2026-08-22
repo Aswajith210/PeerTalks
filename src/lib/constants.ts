@@ -9,7 +9,7 @@ export const TOKEN_ALLOWANCE = {
   INTERVAL_HOURS: 24,
 } as const;
 
-export const MATCHING_TIMEOUT_MS = 120_000;
+export const MATCHING_TIMEOUT_MS = 180_000;
 
 const envSiteUrl = process.env.NEXT_PUBLIC_SITE_URL;
 const SITE_URL_FALLBACK = "https://peer-talks-three.vercel.app";

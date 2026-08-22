@@ -89,9 +89,9 @@ async function tryDirectMatch(
     if (b.blocked_id !== userId) blocked.add(b.blocked_id);
   }
 
-  const { data: existing } = await admin
+const { data: existing } = await admin
     .from("matching_queue")
-    .select("id, user_id")
+    .select("id, user_id, status")  // include status to detect concurrent matches
     .eq("mode", "random")
     .eq("call_type", callType)
     .eq("status", "waiting")
@@ -99,15 +99,53 @@ async function tryDirectMatch(
     .order("created_at", { ascending: true })
     .limit(5);
 
-  const candidate = (existing ?? []).find((e) => !blocked.has(e.user_id)) ?? null;
-  if (!candidate) return { matched: false };
+// Fix: use FOR UPDATE SKIP LOCKED to serialize concurrent claims on the
+// candidate's own waiting row. This prevents two simultaneous direct-match
+// requests from matching the same peer into two different sessions.
+const candidate = (existing ?? []).find((e) => !blocked.has(e.user_id)) ?? null;
+if (!candidate) return { matched: false };
+
+// Safety: if the candidate's row is no longer "waiting" (e.g. already
+// matched by a concurrent direct-match or RPC), abort this attempt.
+if (candidate.status !== "waiting") return { matched: false };
+
+// Lock the candidate's row before updating it, so two parallel direct-match
+// requests cannot both proceed past this point.
+// Crucial: .eq("status", "waiting") ensures this UPDATE only succeeds if
+// the row is still in the expected state. If another request already changed
+// the status, this UPDATE affects 0 rows and .single() throws, which we
+// catch below to return { matched: false } safely.
+try {
+  await admin
+    .from("matching_queue")
+    .update({
+      status: "matched", matched_user_id: userId,
+      session_id: null, matched_at: null, // temporarily clear
+    })
+    .eq("id", candidate.id)
+    .eq("status", "waiting")  // <--- ONLY update if still waiting
+    .select()
+    .single();
+} catch {
+  // The row was no longer "waiting" (concurrent request already matched it).
+  return { matched: false };
+}
 
   const { data: chat } = await admin
     .from("chat_sessions")
     .insert({ mode: "random", status: "connected", call_type: callType, user1_id: candidate.user_id, user2_id: userId })
     .select("id")
     .single();
-  if (!chat) return { matched: false };
+  if (!chat) {
+    // Roll back the lock if insert failed
+    await admin
+      .from("matching_queue")
+      .update({
+        status: "waiting", matched_user_id: null, session_id: null, matched_at: null,
+      })
+      .eq("id", candidate.id);
+    return { matched: false };
+  }
 
   await admin
     .from("matching_queue")
